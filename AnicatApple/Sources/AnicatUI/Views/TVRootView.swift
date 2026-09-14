@@ -700,14 +700,16 @@ private struct SearchTab: View {
             // tvOS draws the search keyboard across the top of the tab and
             // the results underneath it; there is no field to place.
             .searchable(text: $query, prompt: model.appMode == .cinema ? "Search films and series" : "Search anime")
-            // Search on submit rather than on every keystroke: AniList is
-            // rate-limited per minute and a per-character search burns the
-            // budget on prefixes nobody asked for. The TV keyboard has no
-            // submit key of its own -- the query fires when the viewer moves
-            // focus down into the results -- so an empty query clears.
-            .onSubmit(of: .search) { runSearch() }
-            .onChange(of: query) { _, new in
-                if new.isEmpty { runSearch() }
+            // As you type, debounced. The TV keyboard has no submit key --
+            // `onSubmit(of: .search)` never fires on tvOS, so a search that
+            // waited for it never ran. The pause keeps AniList's per-minute
+            // budget off the prefixes: a letter typed every 300ms on the
+            // grid sends one request, not one per letter. `task(id:)`
+            // cancels the pending one on every change.
+            .task(id: query) {
+                try? await Task.sleep(for: .milliseconds(450))
+                guard !Task.isCancelled else { return }
+                runSearch()
             }
             .modifier(DetailPush(model: model, isPresented: $showDetail))
         }
