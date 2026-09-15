@@ -351,6 +351,15 @@ public struct SumiPosterGrid: View {
 public struct SumiPage<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
+    // Computed: a generic type cannot hold a static stored property.
+    static var horizontalInset: CGFloat {
+        #if os(iOS)
+        return 16
+        #else
+        return 40
+        #endif
+    }
+
     public init(@ViewBuilder content: @escaping () -> Content) {
         self.content = content
     }
@@ -360,7 +369,9 @@ public struct SumiPage<Content: View>: View {
             VStack(alignment: .leading, spacing: 20) {
                 content()
             }
-            .padding(.horizontal, 40)
+            // 40pt is a window gutter; on a 402pt phone it left 322pt for
+            // the person pages' grids, one column of a 190pt-minimum grid.
+            .padding(.horizontal, Self.horizontalInset)
             .padding(.top, 40)
             .padding(.bottom, 32)
             .frame(maxWidth: 1200, alignment: .leading)

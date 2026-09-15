@@ -32,7 +32,25 @@ public struct PlayerView: View {
     /// entirely and the player's existing 0.32s fade is the whole entrance.
     public let morphSource: EpisodeMorphSource?
     public let morphThumbnailURL: URL?
+    /// Fired once per session when the first frame has been presented and
+    /// the still has finished opening into it. The host enters fullscreen
+    /// from here: after the picture is up, so the zoom carries a picture
+    /// and nothing else animates under it.
+    public let onFirstFrame: () -> Void
     @State private var showInfoMenu = false
+    @State private var isMiniHovered = false
+    /// The skip window whose pill has timed out. A pill left up for a whole
+    /// ninety-second opening sat over the picture the viewer had chosen to
+    /// watch; moving the mouse brings the controls, and the pill, back.
+    @State private var timedOutSkipWindow: SkipWindow?
+    /// Remembered: whoever opens the stream details once is debugging, and
+    /// will want them again on the next episode.
+    @AppStorage("anicat_player_stream_details") private var showStreamDetails = false
+    /// The same key as Settings' switch; `AppModel`'s defaults observer
+    /// connects or clears Discord the moment it changes.
+    @AppStorage("anicat_discord_presence") private var discordPresence: Bool = true
+    @State private var mpvDetails: [StreamDetailRow] = []
+    @State private var torrentDetails: [StreamDetailRow] = []
     @State private var showEpisodeList = false
     @State private var audioTracks: [PlayerTrack] = []
     @State private var subtitleTracks: [PlayerTrack] = []
@@ -65,13 +83,22 @@ public struct PlayerView: View {
     /// as the session does, so its `@State` resets when the player closes —
     /// one intro per session, which is what it is for.
     @State private var hasShownFirstFrame = false
-    /// The fly-in has arrived. From here until the first frame the still
-    /// is a blurred wash over the whole picture rect, not a card: the
-    /// card is a 1024px episode thumbnail, and held sharp in the middle
-    /// of a 3000px window for the length of the pre-buffer it read as a
-    /// low-quality banner the stream had opened on. Blurred and dimmed it
-    /// is the picture's colour, which is all it has to be.
+    /// The first frame has landed and the card is opening into the picture
+    /// rect while it dissolves. One motion, on purpose: the previous
+    /// version held the card 550ms, then blurred and dimmed it over the
+    /// whole rect (which read as a cut to black), then faded the video in
+    /// under that -- the owner counted four stages between the press and
+    /// the picture. Now the still stays a sharp card for the whole wait
+    /// and the only thing that happens when the stream is ready is the
+    /// card growing into the video.
     @State private var flyInSettled = false
+    /// The surface is shown. Split from `hasShownFirstFrame` so the still
+    /// can stay mounted (and animate its frame) while the video fades in
+    /// under it; a view removed by `if` keeps its last frame and cannot
+    /// grow on the way out.
+    @State private var surfaceRevealed = false
+    /// See the black backdrop in `body`.
+    @State private var backdropShown = false
     #if os(macOS)
     /// The player's own key handling. See `PlayerKeyMonitor` for why it is a
     /// second monitor rather than more cases in `RootView.handleKeyDown`.
@@ -92,7 +119,8 @@ public struct PlayerView: View {
         isMinimized: Bool = false,
         onRestore: @escaping () -> Void = {},
         morphSource: EpisodeMorphSource? = nil,
-        morphThumbnailURL: URL? = nil
+        morphThumbnailURL: URL? = nil,
+        onFirstFrame: @escaping () -> Void = {}
     ) {
         self.controller = controller
         self.streamURL = streamURL
@@ -102,6 +130,7 @@ public struct PlayerView: View {
         self.onRestore = onRestore
         self.morphSource = morphSource
         self.morphThumbnailURL = morphThumbnailURL
+        self.onFirstFrame = onFirstFrame
     }
 
     /// mpv has decoded and presented a frame of the file this session opened
@@ -114,12 +143,65 @@ public struct PlayerView: View {
     /// `video-params/dw`, and waiting on it would strand the placeholder up
     /// over a file that is playing fine.
     private var firstFrameLanded: Bool {
-        !controller.awaitingNewFile && !controller.isBuffering
+        // No stream yet (mounted at the press, waiting on the resolve):
+        // nothing can have landed, whatever the stale flags say.
+        guard streamURL != nil else { return false }
+        return !controller.awaitingNewFile && !controller.isBuffering
     }
 
     /// While true the video surface is transparent and the episode still is
     /// what fills the video frame. Reduce Motion skips the whole thing: the
     /// player's own 0.32s fade already is the plain-fade fallback.
+    /// The chrome, minus the length of a fullscreen transition: see
+    /// `FullScreenState.isTransitioning`. It comes back on the same
+    /// `.smooth` the autohide uses once the window has settled.
+    private var chromeShown: Bool {
+        controller.areControlsVisible && !FullScreenState.shared.isTransitioning && !settlingAfterFullscreen
+    }
+
+    /// Held a beat past `didEnter`/`didExit`. The new window size and the
+    /// chrome's reveal used to land in the same update, and the reveal's
+    /// `.smooth` transaction then carried the size jump with it: bars and
+    /// glow glided from the old window's edges to the new ones, which put
+    /// them mid-screen for a third of a second. With the hold, the resize
+    /// applies in an update of its own, instantly, and the reveal after it
+    /// animates only opacity.
+    @State private var settlingAfterFullscreen = false
+
+    /// The window is at its final size. During a fullscreen zoom AppKit
+    /// lays the SwiftUI content out at the old size, so every overlay
+    /// (bars, glow, skip pill, spinner) drawn then hung mid-screen and
+    /// jumped at the end; only the video surface, an NSView, follows the
+    /// window. Everything but the surface is dropped for the length of it,
+    /// instantly (an animated hide is itself a thing drawn mid-zoom).
+    private var stageReady: Bool {
+        !FullScreenState.shared.isTransitioning && !settlingAfterFullscreen
+    }
+
+    /// The hand-off from still to picture, once both the first frame and
+    /// the window are ready. Idempotent: both `onChange`s call it.
+    private func advanceOpeningIfReady() {
+        guard firstFrameLanded, stageReady, !hasShownFirstFrame, !flyInSettled else { return }
+        guard isFlyingIn else {
+            hasShownFirstFrame = true
+            onFirstFrame()
+            return
+        }
+        // Card opens into the picture and the picture fades in under it,
+        // one curve for both so neither leads. The still is unmounted only
+        // after the curve has settled: removing it in the same transaction
+        // freezes its frame at card size.
+        withAnimation(.smooth(duration: 0.45)) {
+            flyInSettled = true
+            surfaceRevealed = true
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            hasShownFirstFrame = true
+            onFirstFrame()
+        }
+    }
+
     private var isFlyingIn: Bool {
         morphSource != nil && !hasShownFirstFrame && !reduceMotion
     }
@@ -225,14 +307,69 @@ public struct PlayerView: View {
     /// the picture. A 2.35:1 scene in a 16:9 file is 12% top and bottom;
     /// 4% is well under that and well over noise.
     static let chromeInsetFloor = 0.04
+    /// The deepest letterbox a real film has: 2.76:1 (Ben-Hur) in a 16:9
+    /// file is 18% top and bottom. The detector goes to 40% because the
+    /// glow wants the fade case caught; the chrome does not, and a 40%
+    /// "bar" is a dark shot with the subject in the middle.
+    static let chromeInsetCeiling = 0.2
+    /// A letterbox is centred, so its two bars are the same height. A
+    /// scene on black (a hand reaching out of the dark, one line of
+    /// dialogue on a black cut) is bar on one edge only, or bars of two
+    /// different heights, and that is what put the controls' scrim
+    /// halfway up the picture in the tester's report.
+    static let chromeInsetAsymmetry = 0.02
 
     static func chromeInset(_ inset: AmbientContentInset) -> AmbientContentInset {
-        AmbientContentInset(
-            top: inset.top >= chromeInsetFloor ? inset.top : 0,
-            bottom: inset.bottom >= chromeInsetFloor ? inset.bottom : 0,
-            left: 0,
-            right: 0
-        )
+        let letterbox = inset.top >= chromeInsetFloor && inset.bottom >= chromeInsetFloor
+            && inset.top <= chromeInsetCeiling && inset.bottom <= chromeInsetCeiling
+            && abs(inset.top - inset.bottom) <= chromeInsetAsymmetry
+        return letterbox ? AmbientContentInset(top: inset.top, bottom: inset.bottom, left: 0, right: 0) : .zero
+    }
+
+    /// The inset the chrome lays out against, changed only once the
+    /// detector has reported the same thing for `holdSeconds`. The shape
+    /// rule alone still let a dark shot with symmetric black at the top
+    /// and bottom move the scrim for the length of that shot; a film's
+    /// letterbox is there for two hours and can afford to wait a second
+    /// and a half, while a shot on black rarely holds that long.
+    struct ChromeInsetHold {
+        static let holdSeconds = 1.5
+        /// Refinement jitter on a steady bar: the boundary row's blend
+        /// moves the reading by a hundredth or so between samples.
+        static let tolerance = 0.01
+
+        private(set) var current: AmbientContentInset = .zero
+        private var pending: AmbientContentInset = .zero
+        private var pendingSince: TimeInterval?
+
+        private static func same(_ a: AmbientContentInset, _ b: AmbientContentInset) -> Bool {
+            abs(a.top - b.top) <= tolerance && abs(a.bottom - b.bottom) <= tolerance
+        }
+
+        /// Feeds one sample; returns whether `current` changed.
+        @discardableResult
+        mutating func offer(_ inset: AmbientContentInset, at now: TimeInterval) -> Bool {
+            let candidate = PlayerView.chromeInset(inset)
+            if Self.same(candidate, current) {
+                pendingSince = nil
+                return false
+            }
+            if let since = pendingSince, Self.same(candidate, pending) {
+                guard now - since >= Self.holdSeconds else { return false }
+                current = candidate
+                pendingSince = nil
+                return true
+            }
+            pending = candidate
+            pendingSince = now
+            return false
+        }
+
+        mutating func reset() {
+            current = .zero
+            pending = .zero
+            pendingSince = nil
+        }
     }
 
     static func chromeGeometry(
@@ -268,7 +405,7 @@ public struct PlayerView: View {
         let geometry = Self.chromeGeometry(
             windowSize: windowSize,
             aspectRatio: controller.videoAspectRatio,
-            contentInset: glowFrame == nil ? .zero : Self.chromeInset(controller.ambientContentInset)
+            contentInset: glowFrame == nil ? .zero : controller.chromeContentInset
         )
         let videoRect = geometry.videoRect
         let naturalTop = geometry.naturalTop
@@ -289,10 +426,17 @@ public struct PlayerView: View {
             // instant the flag flips. `allowsHitTesting` is not
             // optional here: a fully transparent `Color` still takes every
             // click in the window.
+            // Faded in on appear rather than cut: the player is inserted
+            // with `.identity` (a scaled insertion fought the fullscreen
+            // zoom), so without this the black arrived in one frame while
+            // the card was still lifting off the page.
             Color.black
-                .opacity(isMinimized ? 0 : 1)
+                .opacity(isMinimized ? 0 : (backdropShown ? 1 : 0))
                 .allowsHitTesting(!isMinimized)
                 .ignoresSafeArea()
+                .onAppear {
+                    withAnimation(.smooth(duration: 0.35)) { backdropShown = true }
+                }
 
             // The episode still the play was started from, at the size and
             // place the video is about to occupy. It sits under the surface
@@ -324,11 +468,8 @@ public struct PlayerView: View {
                         .stroke(Color.white.opacity(flyInSettled ? 0 : 0.10), lineWidth: 1)
                 )
                 .shadow(color: .black.opacity(flyInSettled ? 0 : 0.5), radius: 26, y: 10)
-                // See `flyInSettled`. Blurred before it is clipped so the
-                // edges fade into the black around them rather than ending
-                // on a hard line; the blur runs only until the first frame.
-                .blur(radius: flyInSettled ? 56 : 0)
-                .opacity(flyInSettled ? 0.45 : 1)
+                // Dissolves as it opens, over the surface fading in beneath.
+                .opacity(flyInSettled ? 0 : 1)
                 .matchedGeometryEffect(id: morphSource.key, in: morphSource.namespace)
                 // Same reasoning as the detail page's poster:
                 // matchedGeometryEffect only animates the frame, so without
@@ -368,7 +509,7 @@ public struct PlayerView: View {
                 // start of a session, and Core Animation skips the group
                 // pass entirely at exactly 1.0, so the mini-player's
                 // steady-state cost is unchanged.
-                .opacity(isFlyingIn ? 0 : 1)
+                .opacity(isFlyingIn && !surfaceRevealed ? 0 : 1)
                 .ignoresSafeArea(isMinimized ? [] : .all)
                 .frame(
                     width: isMinimized ? Self.miniSize.width : windowSize.width,
@@ -416,29 +557,42 @@ public struct PlayerView: View {
                 // Buffering Spinner — covers both the initial resolve-to-first-frame
                 // stretch and any mid-playback stall, so the black canvas never
                 // sits with nothing on screen while mpv is still working.
-                if controller.isBuffering {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .scaleEffect(1.4)
-                            .tint(SumiTheme.indigo)
-                        Text(bufferingLabel)
-                            .sumiTabularMono(size: 12)
-                            .foregroundColor(PlayerChrome.muted)
+                if controller.isBuffering || (streamURL == nil && !isMinimized) {
+                    if isFlyingIn && !flyInSettled {
+                        // Under the still's card: one quiet line, its top a
+                        // fixed gap below the card's edge. The stacked 1.4x
+                        // spinner was centred 34pt below the edge, and
+                        // `scaleEffect` does not grow layout, so its top half
+                        // was drawn over the bottom of the artwork.
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(PlayerChrome.muted)
+                            Text(bufferingLabel)
+                                .sumiTabularMono(size: 12)
+                                .foregroundColor(PlayerChrome.muted)
+                        }
+                        .fixedSize()
+                        .offset(y: Self.placeholderCardSize(in: windowSize).height / 2 + 30)
+                        .transition(.opacity)
+                    } else {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .scaleEffect(1.4)
+                                .tint(SumiTheme.indigo)
+                            Text(bufferingLabel)
+                                .sumiTabularMono(size: 12)
+                                .foregroundColor(PlayerChrome.muted)
+                        }
+                        .transition(.opacity)
                     }
-                    // Below the still's card while one is up, centred when
-                    // there is none — printed over the card, the spinner sat
-                    // on the artwork it is meant to be waiting beneath.
-                    .offset(y: isFlyingIn && !flyInSettled
-                            ? Self.placeholderCardSize(in: windowSize).height / 2 + 34
-                            : 0)
-                    .transition(.opacity)
                 }
 
                 // Paused Overlay Icon
                 if !controller.isBuffering && !controller.isPlaying && controller.areControlsVisible {
                     Image(systemName: "play.circle.fill")
                         .font(.system(size: 72))
-                        .foregroundColor(SumiTheme.indigo.opacity(0.9))
+                        .foregroundColor(Color.white.opacity(0.85))
                         .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
                         .transition(reduceMotion ? .opacity : .scale(scale: 0.7).combined(with: .opacity))
                 }
@@ -483,7 +637,7 @@ public struct PlayerView: View {
                 // picture untouched and a click there reaches the video.
                 VStack(spacing: 0) {
                     Group {
-                        if controller.areControlsVisible {
+                        if chromeShown {
                             topBar(showsHairline: geometry.topOverlay == 0 && glowFrame == nil).padding(.horizontal, SumiTheme.spaceLg)
                                 .chromeLegibility()
                                 .transition(barTransition(from: .top))
@@ -506,7 +660,7 @@ public struct PlayerView: View {
                             // the top and bottom of the turned picture read
                             // as the chrome growing a black background.
                             // `chromeLegibility` carries the labels there.
-                            if topGap > naturalTop, controller.areControlsVisible, controller.sidewaysState == 0 {
+                            if topGap > naturalTop, chromeShown, controller.sidewaysState == 0 {
                                 LinearGradient(
                                     colors: [Color.black.opacity(0.78), Color.black.opacity(0)],
                                     startPoint: .top,
@@ -516,12 +670,12 @@ public struct PlayerView: View {
                             }
                         }
                     }
-                    .allowsHitTesting(controller.areControlsVisible)
+                    .allowsHitTesting(chromeShown)
 
                     Spacer(minLength: 0)
 
                     Group {
-                        if controller.areControlsVisible {
+                        if chromeShown {
                             PlayerBottomBar(controller: controller, showsHairline: geometry.bottomOverlay == 0 && glowFrame == nil).padding(.horizontal, SumiTheme.spaceLg)
                                 .chromeLegibility()
                                 .transition(barTransition(from: .bottom))
@@ -532,7 +686,7 @@ public struct PlayerView: View {
                     .frame(maxWidth: .infinity)
                     .background(alignment: .bottom) {
                         VStack(spacing: 0) {
-                            if bottomGap > naturalBottom, controller.areControlsVisible, controller.sidewaysState == 0 {
+                            if bottomGap > naturalBottom, chromeShown, controller.sidewaysState == 0 {
                                 LinearGradient(
                                     colors: [Color.black.opacity(0), Color.black.opacity(0.82)],
                                     startPoint: .top,
@@ -544,13 +698,18 @@ public struct PlayerView: View {
                                 .frame(height: naturalBottom)
                         }
                     }
-                    .allowsHitTesting(controller.areControlsVisible)
+                    .allowsHitTesting(chromeShown)
                 }
-                .animation(.smooth, value: controller.areControlsVisible)
+                // Instant while the window is mid-zoom: the bars' own hide
+                // animation was the "UI hanging in the middle".
+                .animation(stageReady ? .smooth : nil, value: chromeShown)
                 // A gap that changes (the aspect landing, an encoded bar
                 // found) glides rather than jumps: the bars sit on the
                 // picture's edge and a one-frame hop there reads as a glitch.
-                .animation(.smooth, value: geometry)
+                // Not during a fullscreen transition: the window is
+                // already at its new size and a 0.35s glide of the gaps
+                // toward it is the chrome arriving late.
+                .animation(FullScreenState.shared.isTransitioning || settlingAfterFullscreen ? nil : .smooth, value: geometry)
                 .transition(Self.chromeTransition)
 
                 // Skip pill / auto-skip flash (bottom right). Kept floating
@@ -558,9 +717,11 @@ public struct PlayerView: View {
                 // contextual action tied to what's playing right now, meant to
                 // be seen right where the eye already is, the way
                 // Netflix/Crunchyroll place it.
-                skipOverlay
-                    .frame(width: videoRect.width, height: videoRect.height)
-                    .position(x: videoRect.midX, y: videoRect.midY)
+                if stageReady {
+                    skipOverlay
+                        .frame(width: videoRect.width, height: videoRect.height)
+                        .position(x: videoRect.midX, y: videoRect.midY)
+                }
 
                 // Same corner as the pill above, which is why the pill stands
                 // down while this is up rather than the two stacking.
@@ -578,6 +739,22 @@ public struct PlayerView: View {
                     Color.clear
                         .contentShape(Rectangle())
                         .onTapGesture(perform: onRestore)
+                    // Play/pause in the middle while the pointer is over
+                    // the box, and a hairline of progress along its bottom
+                    // edge. The transport lived only in the menu bar before,
+                    // which nobody looked for while a video was on screen.
+                    if isMiniHovered {
+                        Button(action: controller.togglePlayPause) {
+                            Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(.white)
+                                .frame(width: 44, height: 44)
+                                .playerScrim(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    }
                     Button(action: onClose) {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 16))
@@ -586,8 +763,27 @@ public struct PlayerView: View {
                     }
                     .buttonStyle(.plain)
                     .padding(6)
+                    .opacity(isMiniHovered ? 1 : 0.7)
+                    VStack {
+                        Spacer(minLength: 0)
+                        GeometryReader { geo in
+                            Rectangle()
+                                .fill(SumiTheme.indigo)
+                                .frame(width: geo.size.width * CGFloat(controller.progressFraction))
+                                // Once a second, like the menu bar's
+                                // scrubber; without it the line hops.
+                                .animation(controller.isScrubbing ? nil : .linear(duration: 1), value: controller.progressFraction)
+                        }
+                        .frame(height: 2)
+                    }
+                    .allowsHitTesting(false)
                 }
                 .frame(width: Self.miniSize.width, height: Self.miniSize.height)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .animation(.snappy, value: isMiniHovered)
+                #if os(macOS)
+                .onHover { isMiniHovered = $0 }
+                #endif
                 .position(miniCenter)
                 .transition(Self.chromeTransition)
             }
@@ -620,11 +816,22 @@ public struct PlayerView: View {
         }
         #if os(macOS)
         .onAppear {
-            keyMonitor.onKey = { isSkipKey in
-                // The card supersedes the pill: while it is up, every key is
-                // "not now" and none of them is consumed, so the key the
-                // viewer actually pressed still does its usual job.
+            keyMonitor.onKey = { isSkipKey, isReturn in
+                // The card supersedes the pill: while it is up, Return is
+                // its "Play now" and every other key but the seek and pause
+                // keys (which `PlayerKeyMonitor` keeps from reaching here)
+                // is "not now", not consumed, so the key the viewer pressed
+                // still does its job. Return used to cancel too: the owner
+                // pressed it *on* the card, the card went, the episode ran
+                // to its last frame and sat there, and the log read
+                // "eof-reached ... countdown cancelled".
                 if controller.nextEpisodeCountdown.isVisible {
+                    if isReturn {
+                        withAnimation(.smooth) {
+                            controller.playNextEpisodeNow()
+                        }
+                        return true
+                    }
                     withAnimation(.smooth) {
                         controller.cancelNextEpisodeCountdown()
                     }
@@ -668,10 +875,6 @@ public struct PlayerView: View {
             guard !Task.isCancelled else { return }
             controller.setAmbientStill(still)
         }
-        // Latched, not mirrored: see `hasShownFirstFrame`. The curve is the
-        // same 0.32s the player's own entrance uses (`resolveAndPlay`), so
-        // the still handing over to the picture reads as one move with the
-        // dim rather than a second, faster thing happening on top of it.
         // The track lists, filled as the episode loads rather than when the
         // menu is opened. `refreshTracks` on the menu's own button was the
         // only reader, and mpv reports no tracks at all until the file is
@@ -690,25 +893,23 @@ public struct PlayerView: View {
                 if Task.isCancelled { return }
             }
         }
-        // The card holds still for the length of the morph (the app's
-        // `.smooth` spring settles in about half a second) and then
-        // dissolves into the wash. Not on `firstFrameLanded`: that is the
-        // moment the whole placeholder goes, and the point is what shows
-        // during the seconds before it.
-        .task {
-            guard morphSource != nil, !reduceMotion else { return }
-            try? await Task.sleep(nanoseconds: 550_000_000)
-            guard !Task.isCancelled, !hasShownFirstFrame else { return }
-            withAnimation(.easeInOut(duration: 0.7)) {
-                flyInSettled = true
+        .onChange(of: FullScreenState.shared.isTransitioning) { _, transitioning in
+            if transitioning {
+                settlingAfterFullscreen = true
+            } else {
+                Task {
+                    // Two frames is enough for the layout pass that carries
+                    // the new size; 150ms leaves margin for a busy main thread.
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    settlingAfterFullscreen = false
+                }
             }
         }
-        .onChange(of: firstFrameLanded) { _, landed in
-            guard landed, !hasShownFirstFrame else { return }
-            withAnimation(.easeInOut(duration: 0.32)) {
-                hasShownFirstFrame = true
-            }
-        }
+        .onChange(of: firstFrameLanded) { _, _ in advanceOpeningIfReady() }
+        // A stream that lands during the zoom waits here for the window:
+        // opening the card while the layout is still the old size is the
+        // mid-screen hang all over again.
+        .onChange(of: stageReady) { _, _ in advanceOpeningIfReady() }
         .onChange(of: showEpisodeList || showInfoMenu) { _, isOpen in
             controller.isMenuOpen = isOpen
             if isOpen {
@@ -767,8 +968,7 @@ public struct PlayerView: View {
         .foregroundColor(.white)
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
-        .background(Color.black.opacity(0.55))
-        .clipShape(Capsule())
+        .playerScrim(Capsule())
     }
 
     private func hudBadge(_ hud: PlayerController.HUDFlash) -> some View {
@@ -782,9 +982,7 @@ public struct PlayerView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(Color.black.opacity(0.62))
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 1))
+        .playerScrim(Capsule())
     }
 
     /// What the chrome bars sit on. See the top bar's comment.
@@ -839,7 +1037,7 @@ public struct PlayerView: View {
     /// unlit.
     @ViewBuilder
     private func ambientGlowLayer(geometry: ChromeGeometry, windowSize: CGSize) -> some View {
-        if let frame = glowFrame, windowSize.width > 0, windowSize.height > 0 {
+        if stageReady, let frame = glowFrame, windowSize.width > 0, windowSize.height > 0 {
             AmbientGlowView(
                 frame: frame,
                 video: geometry.videoRect,
@@ -857,8 +1055,12 @@ public struct PlayerView: View {
     /// and `skipFlashLabel` is what reports it instead.
     private var skipPillWindow: SkipWindow? {
         guard !controller.autoSkipEnabled, !controller.nextEpisodeCountdown.isVisible else { return nil }
-        return controller.pendingSkipWindow
+        guard let window = controller.pendingSkipWindow else { return nil }
+        if window == timedOutSkipWindow && !controller.areControlsVisible { return nil }
+        return window
     }
+
+    private static let skipPillTimeout: Duration = .seconds(6)
 
     /// The episode the card is offering. Read from `episodeList` rather than
     /// from a value the controller could hold: that list is the same one the
@@ -900,8 +1102,16 @@ public struct PlayerView: View {
                                 .lineLimit(2)
                                 .fixedSize(horizontal: false, vertical: true)
                             HStack(spacing: 8) {
-                                Button("Play now") {
+                                Button {
                                     controller.playNextEpisodeNow()
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text("Play now")
+                                        // The same key hint the skip pill carries.
+                                        Text("↵")
+                                            .sumiTabularMono(size: 10, weight: .medium)
+                                            .opacity(0.6)
+                                    }
                                 }
                                 .buttonStyle(.sumiPressable)
                                 .font(.system(size: 11, weight: .semibold))
@@ -920,12 +1130,7 @@ public struct PlayerView: View {
                         countdownIndicator
                     }
                     .padding(12)
-                    .background(Color.black.opacity(0.82))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(SumiTheme.border.opacity(0.7), lineWidth: 1)
-                    )
+                    .playerScrim(RoundedRectangle(cornerRadius: 12))
                     .shadow(color: Color.black.opacity(0.4), radius: 16, y: 6)
                     .padding(.trailing, 24)
                     .padding(.bottom, controller.areControlsVisible ? 100 : 24)
@@ -949,6 +1154,7 @@ public struct PlayerView: View {
                 .sumiTabularMono(size: 20, weight: .bold)
                 .foregroundColor(PlayerChrome.foreground)
                 .frame(width: 40, height: 40)
+                .contentShape(Rectangle())
         } else {
             ZStack {
                 Circle()
@@ -963,6 +1169,7 @@ public struct PlayerView: View {
                     .foregroundColor(PlayerChrome.foreground)
             }
             .frame(width: 40, height: 40)
+            .contentShape(Rectangle())
         }
     }
 
@@ -986,8 +1193,7 @@ public struct PlayerView: View {
                         .foregroundColor(PlayerChrome.foreground)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 7)
-                        .background(Color.black.opacity(0.6))
-                        .clipShape(Capsule())
+                        .playerScrim(Capsule())
                         .transition(.opacity)
                     }
                     if let window = skipPillWindow {
@@ -1022,6 +1228,12 @@ public struct PlayerView: View {
             }
         }
         .animation(.smooth, value: skipPillWindow)
+        .task(id: controller.pendingSkipWindow) {
+            guard let window = controller.pendingSkipWindow else { return }
+            try? await Task.sleep(for: Self.skipPillTimeout)
+            guard !Task.isCancelled else { return }
+            timedOutSkipWindow = window
+        }
         .animation(.smooth, value: controller.skipFlashLabel)
     }
 
@@ -1039,9 +1251,12 @@ public struct PlayerView: View {
         HStack(alignment: .center, spacing: 12) {
             Button(action: onClose) {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(PlayerChrome.foreground)
-                    .frame(width: 28, height: 28)
+                    // 44pt, the platform minimum, on a glyph in the far
+                    // corner: at 28pt it was "hard to click" (owner).
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)
 
@@ -1076,7 +1291,8 @@ public struct PlayerView: View {
                     Image(systemName: "pip.enter")
                         .font(.system(size: 13))
                         .foregroundColor(PlayerChrome.foreground.opacity(0.85))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
                 .help("Minimize Player")
@@ -1087,7 +1303,8 @@ public struct PlayerView: View {
                     Image(systemName: controller.autoPlayNextEnabled ? "play.square.stack.fill" : "play.square.stack")
                         .font(.system(size: 13))
                         .foregroundColor(controller.autoPlayNextEnabled ? SumiTheme.indigo : PlayerChrome.foreground.opacity(0.85))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
                 .help(controller.autoPlayNextEnabled ? "Auto-Play Next: On" : "Auto-Play Next: Off")
@@ -1101,11 +1318,30 @@ public struct PlayerView: View {
                     Image(systemName: controller.autoSkipEnabled ? "forward.circle.fill" : "forward.circle")
                         .font(.system(size: 13))
                         .foregroundColor(controller.autoSkipEnabled ? SumiTheme.indigo : PlayerChrome.foreground.opacity(0.85))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
-                .help(controller.autoSkipEnabled ? "Auto-Skip Intro/Outro: On" : "Auto-Skip Intro/Outro: Off")
+                .help(autoSkipHelp)
                 .accessibilityLabel(controller.autoSkipEnabled ? "Auto-Skip Intro/Outro: On" : "Auto-Skip Intro/Outro: Off")
+
+                // Discord presence, here as well as in Settings: whether the
+                // profile says what is on is decided per episode, and Settings
+                // meant leaving the player to change it.
+                Button(action: {
+                    discordPresence.toggle()
+                    controller.flashHUD(discordPresence ? "Discord status on" : "Discord status off",
+                                        symbol: discordPresence ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+                }) {
+                    Image(systemName: discordPresence ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+                        .font(.system(size: 13))
+                        .foregroundColor(discordPresence ? SumiTheme.indigo : PlayerChrome.foreground.opacity(0.85))
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.sumiPressable)
+                .help(discordPresence ? "Discord Rich Presence: On" : "Discord Rich Presence: Off")
+                .accessibilityLabel(discordPresence ? "Discord Rich Presence: On" : "Discord Rich Presence: Off")
 
                 // Episode List
                 if !controller.episodeList.isEmpty {
@@ -1113,7 +1349,8 @@ public struct PlayerView: View {
                         Image(systemName: "list.bullet")
                             .font(.system(size: 13))
                             .foregroundColor(PlayerChrome.foreground.opacity(0.85))
-                            .frame(width: 28, height: 28)
+                            .frame(width: 40, height: 40)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.sumiPressable)
                     .help("Episodes")
@@ -1132,7 +1369,8 @@ public struct PlayerView: View {
                     Image(systemName: "info.circle")
                         .font(.system(size: 13))
                         .foregroundColor(PlayerChrome.foreground.opacity(0.85))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
                 .help("Info & Options")
@@ -1349,12 +1587,121 @@ public struct PlayerView: View {
                 Divider()
                 releaseSection
             }
+
+            Divider()
+            streamDetailsSection
         }
         .padding(16)
         .frame(width: 360, alignment: .leading)
         }
+        // Once a second while the section is open. Both reads are hops off
+        // the main thread (mpv's core lock, the engine queue), and nothing
+        // here runs while the popover is closed.
+        .task(id: showStreamDetails) {
+            guard showStreamDetails else { return }
+            while !Task.isCancelled {
+                controller.onFetchMpvDetails? { rows in mpvDetails = rows }
+                controller.onFetchTorrentDetails? { rows in torrentDetails = rows }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
         .frame(width: 360, height: 460)
         .scrollBounceBehavior(.basedOnSize)
+    }
+
+    /// The toggle's tooltip, which also says when there is nothing to skip:
+    /// an "On" over an episode with no skip times read as the feature being
+    /// broken.
+    private var autoSkipHelp: String {
+        let state = controller.autoSkipEnabled ? "Auto-Skip Intro/Outro: On" : "Auto-Skip Intro/Outro: Off"
+        guard controller.skipWindows.isEmpty, let status = controller.aniSkipStatus,
+              !status.hasPrefix("Asking"), !status.hasPrefix("Waiting") else { return state }
+        return "\(state). No skip times for this episode (AniSkip: \(status))"
+    }
+
+    /// Everything the player knows about what it is playing and why it will
+    /// or will not skip and advance. "AniSkip doesn't work" and "autoplay
+    /// is on and nothing happened" both came with nothing on screen to say
+    /// which of several sources or gates was the reason.
+    private var streamDetailsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                showStreamDetails.toggle()
+            } label: {
+                HStack {
+                    Text("Stream details")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(SumiTheme.muted)
+                    Spacer()
+                    Image(systemName: showStreamDetails ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(SumiTheme.muted)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.sumiPressable)
+
+            if showStreamDetails {
+                detailGroup("Skipping", skipDetailRows)
+                detailGroup("Next episode", autoNextDetailRows)
+                if !torrentDetails.isEmpty {
+                    detailGroup("Torrent", torrentDetails)
+                }
+                detailGroup("Playback", mpvDetails)
+            }
+        }
+    }
+
+    private var skipDetailRows: [StreamDetailRow] {
+        func span(_ start: Double?, _ end: Double?) -> String {
+            guard let start else { return "none" }
+            let from = PlayerController.formatTimestamp(start)
+            return end.map { "\(from) - \(PlayerController.formatTimestamp($0))" } ?? from
+        }
+        let chapterWindows = controller.skipWindows.filter { !$0.chapterTitle.isEmpty }
+        return [
+            StreamDetailRow("Auto-skip", controller.autoSkipEnabled ? "on" : "off"),
+            StreamDetailRow("Chapters", controller.chapters.isEmpty
+                ? "none in this file"
+                : "\(controller.chapters.count), \(chapterWindows.count) usable as skip windows"),
+            StreamDetailRow("AniSkip", controller.aniSkipStatus ?? "not used for this title"),
+            StreamDetailRow("Audio detection", controller.skipDetectionStatus ?? "not run"),
+            StreamDetailRow("Intro", span(controller.introStartTime, controller.introEndTime)),
+            StreamDetailRow("Outro", span(controller.outroStartTime, controller.outroEndTime)),
+        ]
+    }
+
+    private var autoNextDetailRows: [StreamDetailRow] {
+        let trigger = controller.outroStartTime ?? max(controller.duration - PlayerController.countdownTailSeconds, 0)
+        return [
+            StreamDetailRow("Autoplay", controller.autoPlayNextEnabled ? "on" : "off"),
+            StreamDetailRow("Next episode", controller.hasNextEpisode
+                ? "available"
+                : (controller.episodeList.isEmpty ? "episode list not loaded" : "none aired after this one")),
+            StreamDetailRow("Card", "\(controller.nextEpisodeCountdown.phase), arms at \(PlayerController.formatTimestamp(trigger))"),
+            StreamDetailRow("Position", "\(controller.formattedCurrentTime) of \(controller.formattedDuration)"),
+        ]
+    }
+
+    private func detailGroup(_ title: String, _ rows: [StreamDetailRow]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased())
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundColor(SumiTheme.muted)
+            ForEach(rows) { row in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(row.label)
+                        .font(.system(size: 10.5))
+                        .foregroundColor(SumiTheme.muted)
+                        .frame(width: 92, alignment: .leading)
+                    Text(row.value)
+                        .sumiTabularMono(size: 10.5)
+                        .foregroundColor(SumiTheme.foreground)
+                        .sumiTextSelectable()
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
 
     /// The same releases the detail page's "Stream Servers" popover lists,
@@ -1369,6 +1716,25 @@ public struct PlayerView: View {
                 Spacer(minLength: 8)
                 if isLoadingReleases {
                     ProgressView().controlSize(.small)
+                }
+                // Anime only: the film and series resolves do not read the
+                // rejections yet, and the same release would come straight back.
+                if let reject = controller.onRejectRelease, !controller.isLiveAction {
+                    Button {
+                        showInfoMenu = false
+                        reject()
+                    } label: {
+                        // A verb, not a verdict: "Wrong episode" read as the
+                        // player saying the viewer was watching the wrong one.
+                        Label("Block & find another", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(SumiTheme.dangerLight)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.sumiPressable)
+                    .help("If this video is the wrong episode or show: stop using this release for this title and play the episode from another one")
                 }
             }
 
@@ -1642,7 +2008,7 @@ private struct PlayerBottomBar: View {
     /// the two, which is most of them.
     @State private var lastScrubTime: Double?
 
-    private static let tooltipWidth: CGFloat = 150
+    @State private var tooltipWidth: CGFloat = 0
 
     /// Time, and the chapter that time is inside. There is no frame preview
     /// here and deliberately so: the only way to render one without seeking
@@ -1672,18 +2038,20 @@ private struct PlayerBottomBar: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
-            .frame(width: Self.tooltipWidth)
-            .background(Color.black.opacity(0.85))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(SumiTheme.border.opacity(0.6), lineWidth: 1)
-            )
+            .fixedSize()
+            // Sized to its text and drawn as glass: the fixed-width
+            // near-black slab read as a bar sitting on the picture.
+            .playerScrim(RoundedRectangle(cornerRadius: 8))
+            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
             .allowsHitTesting(false)
             // Clamped to the bar rather than centred on the pointer at the
             // ends, where centring would hang it off the window.
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { tooltipWidth = $0 }
+            // Centred on the pointer by the tooltip's real width. It used a
+            // fixed 150 after the tooltip became sized to its text (~50 pt
+            // for "04:21"), so it sat well left of the mouse.
             .offset(
-                x: min(max(hoverFraction * width - Self.tooltipWidth / 2, 0), max(width - Self.tooltipWidth, 0)),
+                x: min(max(hoverFraction * width - tooltipWidth / 2, 0), max(width - tooltipWidth, 0)),
                 y: -46
             )
         }
@@ -1719,6 +2087,20 @@ private struct PlayerBottomBar: View {
                 Capsule()
                     .fill(Color.white.opacity(0.2))
                     .frame(height: thickness)
+                // What is already fetched, under the played part: the
+                // viewer can see how far a seek can land without a stall.
+                if controller.duration > 0 {
+                    ForEach(Array(controller.bufferedRanges.enumerated()), id: \.offset) { _, span in
+                        let x0 = geo.size.width * CGFloat(min(max(span.start / controller.duration, 0), 1))
+                        let x1 = geo.size.width * CGFloat(min(max(span.end / controller.duration, 0), 1))
+                        Capsule()
+                            .fill(Color.white.opacity(0.28))
+                            .frame(width: max(x1 - x0, 0), height: thickness)
+                            .offset(x: x0)
+                    }
+                    .allowsHitTesting(false)
+                    .animation(.sumi(.tab), value: controller.bufferedRanges)
+                }
                 Capsule()
                     .fill(SumiTheme.indigo)
                     .frame(width: playhead, height: thickness)
@@ -1788,16 +2170,17 @@ private struct PlayerBottomBar: View {
     }
 
     var body: some View {
-        // 28 pt hit targets on every icon (the glyphs themselves are 14 pt,
-        // and a 14 pt target at the far end of a 1512 pt bar was "hard to
-        // click"), so the row spacing comes down to keep the same rhythm.
-        HStack(spacing: 8) {
+        // 40 pt hit targets on every icon, glyphs still 14 pt. At 28 pt the
+        // owner still had to "be very precise"; the row spacing drops to 2 so
+        // the bar is barely wider than it was, and 40 fits the 48 pt minimum
+        // bar height with room to spare.
+        HStack(spacing: 2) {
             // Previous Episode
             Button(action: { controller.previousEpisode() }) {
                 Image(systemName: "backward.end.fill")
                 .font(.system(size: 14))
                 .foregroundColor(controller.hasPreviousEpisode ? PlayerChrome.foreground.opacity(0.8) : PlayerChrome.muted.opacity(0.4))
-                .frame(width: 28, height: 28)
+                .frame(width: 40, height: 40)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)
@@ -1816,45 +2199,49 @@ private struct PlayerBottomBar: View {
                     .font(.system(size: 14, weight: .bold))
                     .contentTransition(.symbolEffect(.replace))
                     .animation(.snappy(duration: 0.25), value: controller.isPlaying)
-                    .foregroundColor(SumiTheme.background)
-                    .frame(width: 30, height: 30)
-                    .background(SumiTheme.indigo)
-                    .clipShape(Circle())
+                    // White on a faint disc, not a filled indigo circle: with
+                    // the big paused glyph and the volume slider also indigo
+                    // the bar read as "a bit too much" blue (owner).
+                    .foregroundColor(PlayerChrome.foreground)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(Color.white.opacity(0.16)))
+                    .frame(width: 40, height: 40)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)
             .help(controller.isPlaying ? "Pause (Space)" : "Play (Space)")
             .accessibilityLabel(controller.isPlaying ? "Pause" : "Play")
 
-            // Seek -10s
-            Button(action: { controller.seekRelative(by: -10) }) {
-                Image(systemName: "gobackward.10")
+            // Seek -5s
+            Button(action: { controller.seekRelative(by: -5) }) {
+                Image(systemName: "gobackward.5")
                 .font(.system(size: 15))
                 .foregroundColor(PlayerChrome.foreground.opacity(0.8))
-                .frame(width: 28, height: 28)
+                .frame(width: 40, height: 40)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)
-            .help("Back 10 seconds")
-            .accessibilityLabel("Back 10 seconds")
+            .help("Back 5 seconds")
+            .accessibilityLabel("Back 5 seconds")
 
-            // Seek +10s
-            Button(action: { controller.seekRelative(by: 10) }) {
-                Image(systemName: "goforward.10")
+            // Seek +5s
+            Button(action: { controller.seekRelative(by: 5) }) {
+                Image(systemName: "goforward.5")
                 .font(.system(size: 15))
                 .foregroundColor(PlayerChrome.foreground.opacity(0.8))
-                .frame(width: 28, height: 28)
+                .frame(width: 40, height: 40)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)
-            .help("Forward 10 seconds")
-            .accessibilityLabel("Forward 10 seconds")
+            .help("Forward 5 seconds")
+            .accessibilityLabel("Forward 5 seconds")
 
             // Next Episode
             Button(action: { controller.nextEpisode() }) {
                 Image(systemName: "forward.end.fill")
                 .font(.system(size: 14))
                 .foregroundColor(controller.hasNextEpisode ? PlayerChrome.foreground.opacity(0.8) : PlayerChrome.muted.opacity(0.4))
-                .frame(width: 28, height: 28)
+                .frame(width: 40, height: 40)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)
@@ -1887,7 +2274,7 @@ private struct PlayerBottomBar: View {
                         Image(systemName: volumeIcon)
                         .font(.system(size: 14))
                         .foregroundColor(PlayerChrome.foreground.opacity(0.8))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 40, height: 40)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.sumiPressable)
@@ -1902,7 +2289,7 @@ private struct PlayerBottomBar: View {
                             set: { controller.setVolume($0) }
                         ), in: 0...1)
                     .frame(width: 80)
-                    .tint(SumiTheme.indigo)
+                    .tint(PlayerChrome.foreground.opacity(0.85))
                     #endif
                 }
 
@@ -1911,7 +2298,7 @@ private struct PlayerBottomBar: View {
                     Image(systemName: "sparkles")
                     .font(.system(size: 14))
                     .foregroundColor(controller.isAnime4KEnabled ? SumiTheme.indigo : PlayerChrome.foreground.opacity(0.8))
-                    .frame(width: 28, height: 28)
+                    .frame(width: 40, height: 40)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
@@ -1927,7 +2314,7 @@ private struct PlayerBottomBar: View {
                     Image(systemName: ambientGlowEnabled ? "light.max" : "light.min")
                     .font(.system(size: 14))
                     .foregroundColor(ambientGlowEnabled ? SumiTheme.indigo : PlayerChrome.foreground.opacity(0.8))
-                    .frame(width: 28, height: 28)
+                    .frame(width: 40, height: 40)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
@@ -1939,7 +2326,7 @@ private struct PlayerBottomBar: View {
                     Image(systemName: "rotate.right")
                     .font(.system(size: 14))
                     .foregroundColor(controller.sidewaysState != 0 ? SumiTheme.indigo : PlayerChrome.foreground.opacity(0.8))
-                    .frame(width: 28, height: 28)
+                    .frame(width: 40, height: 40)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
@@ -1960,7 +2347,7 @@ private struct PlayerBottomBar: View {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                     .font(.system(size: 14))
                     .foregroundColor(PlayerChrome.foreground.opacity(0.8))
-                    .frame(width: 28, height: 28)
+                    .frame(width: 40, height: 40)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
@@ -1994,6 +2381,30 @@ private struct PlayerBottomBar: View {
 enum PlayerChrome {
     static var foreground: Color { SumiPalette.ink.foreground }
     static var muted: Color { SumiPalette.ink.muted }
+
+    /// What a transient card over the picture sits on when the system
+    /// refuses materials. Dark enough to hold white text over a white
+    /// frame; the material path below carries the same job by blurring.
+    static let scrimFallback = Color.black.opacity(0.72)
+    static let scrimEdge = Color.white.opacity(0.12)
+}
+
+extension View {
+    /// The one ground for anything that floats over the picture: the seek
+    /// flash, the HUD badge, the skip and Up Next cards, the seek tooltip.
+    ///
+    /// They used to carry five hand-picked blacks between 0.55 and 0.85,
+    /// and side by side (a HUD badge fading while the Up Next card was up)
+    /// read as five different components. Glass over the picture, pinned
+    /// dark so the material does not flip to its light look on a white
+    /// frame, with the ink chrome's hairline; a solid scrim under Reduce
+    /// Transparency, where a blurred panel over a bright shot is unreadable.
+    func playerScrim<S: InsettableShape>(_ shape: S) -> some View {
+        self.sumiMaterialBackground(.ultraThinMaterial, fallback: PlayerChrome.scrimFallback)
+            .environment(\.colorScheme, .dark)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(PlayerChrome.scrimEdge, lineWidth: 1))
+    }
 }
 
 

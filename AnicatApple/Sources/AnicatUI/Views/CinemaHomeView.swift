@@ -181,18 +181,31 @@ struct CinemaHomeView: View {
                 alignment: .leading,
                 spacing: 20
             ) {
-                ForEach(results) { item in
+                ForEach(Array(results.enumerated()), id: \.element.id) { index, item in
                     card(item, shelf: "cinemaSearch")
+                        // The next page is asked for when a card near the end
+                        // is built, which `LazyVGrid` does only as it scrolls
+                        // into reach. The request used to hang off the footer
+                        // below, but that sits in the page's plain `VStack`,
+                        // which builds it at once: every page that landed
+                        // re-keyed its task and fetched the next, and the
+                        // grid loaded films forever with nobody scrolling.
+                        .onAppear {
+                            guard index == max(results.count - 6, 0),
+                                  model.cinemaSearchHasMore,
+                                  !model.isLoadingMoreCinema else { return }
+                            Task {
+                                await model.searchCinema(
+                                    model.searchQuery,
+                                    page: model.cinemaSearchPage + 1,
+                                    append: true
+                                )
+                            }
+                        }
                 }
             }
 
-            // The next page fetches itself when the foot of the grid comes
-            // into view, instead of asking to be asked. A "Load more" button
-            // is a click that only ever has one answer, and the grid it sits
-            // under is `LazyVGrid` -- the rows below the viewport are not
-            // built until they are scrolled to anyway, so the page boundary
-            // was visible for no reason.
-            if model.cinemaSearchHasMore {
+            if model.cinemaSearchHasMore, model.isLoadingMoreCinema {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
@@ -202,17 +215,6 @@ struct CinemaHomeView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 12)
-                // Keyed on the page number: `task(id:)` re-runs when the id
-                // changes, so each arriving page arms the next fetch, and a
-                // row that scrolls away and back does not fetch twice.
-                .task(id: model.cinemaSearchPage) {
-                    guard !model.isLoadingMoreCinema else { return }
-                    await model.searchCinema(
-                        model.searchQuery,
-                        page: model.cinemaSearchPage + 1,
-                        append: true
-                    )
-                }
             }
         }
     }
@@ -441,10 +443,10 @@ struct CinemaHomeView: View {
             )
 
             if model.cinemaWatchlist.isEmpty {
-                Text("Nothing on this list yet. Add a film or series from its page.")
-                    .font(.system(size: 13))
-                    .foregroundColor(SumiTheme.muted)
-                    .padding(.vertical, 24)
+                SumiEmptyState(
+                    headline: "Nothing on this list yet",
+                    detail: "Add a film or series from its page."
+                )
             } else {
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 16)],
@@ -462,15 +464,10 @@ struct CinemaHomeView: View {
     @ViewBuilder
     private var continueWatching: some View {
         if model.cinemaContinueWatching.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Nothing started yet")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(SumiTheme.foreground)
-                Text("Films and series you play show up here, with the position they stopped at. It is kept on this device -- nothing is sent anywhere.")
-                    .font(.system(size: 13))
-                    .foregroundColor(SumiTheme.muted)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            SumiEmptyState(
+                headline: "Nothing started yet",
+                detail: "Films and series you play show up here, with the position they stopped at. It is kept on this device -- nothing is sent anywhere."
+            )
             .padding(.vertical, 40)
         } else {
             VStack(alignment: .leading, spacing: 24) {

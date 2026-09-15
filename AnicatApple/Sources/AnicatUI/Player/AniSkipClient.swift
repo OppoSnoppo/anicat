@@ -34,11 +34,28 @@ public enum AniSkipClient {
 
     private static let session = URLSession(configuration: .ephemeral)
 
-    /// `nil` on any failure (no mapping, no data for this episode, network
-    /// error, malformed response) — callers treat that the same as "AniSkip
-    /// has nothing for this episode", not as an error to surface to the
-    /// viewer. Skip times are a nicety, not something worth an error toast.
+    /// What a lookup came back with. The player's stream details show it:
+    /// a 404 (nobody has submitted times for this episode, the usual case
+    /// for a show in its first weeks) and a failed request both used to be
+    /// a `nil` indistinguishable from each other, and from a skip that
+    /// simply had not happened yet.
+    public enum Lookup: Sendable, Equatable {
+        case found(SkipTimes)
+        case notFound
+        case failed(String)
+    }
+
+    /// `nil` on any failure; see `lookup` for which one.
     public static func skipTimes(malId: Int64, episode: Int, episodeLengthSeconds: Double) async -> SkipTimes? {
+        if case .found(let times) = await lookup(malId: malId, episode: episode, episodeLengthSeconds: episodeLengthSeconds) {
+            return times
+        }
+        return nil
+    }
+
+    /// Not an error to surface as a toast either way: skip times are a
+    /// nicety. The outcome is for the stream details panel and the log.
+    public static func lookup(malId: Int64, episode: Int, episodeLengthSeconds: Double) async -> Lookup {
         var components = URLComponents(string: "https://api.aniskip.com/v2/skip-times/\(malId)/\(episode)")
         components?.queryItems = [
             URLQueryItem(name: "types", value: "op"),
@@ -47,14 +64,14 @@ public enum AniSkipClient {
         ]
         guard let url = components?.url else {
             print("[AniSkip] malformed URL for MAL id \(malId) episode \(episode)")
-            return nil
+            return .failed("malformed URL")
         }
 
         do {
             let (data, response) = try await session.data(from: url)
             guard let http = response as? HTTPURLResponse else {
                 print("[AniSkip] no HTTP response for \(url.absoluteString)")
-                return nil
+                return .failed("no HTTP response")
             }
             guard http.statusCode == 200 else {
                 // 404 here means "no skip times for this episode", which is
@@ -63,12 +80,12 @@ public enum AniSkipClient {
                 // worth alarming about, just worth being able to see when
                 // debugging "why didn't this skip".
                 print("[AniSkip] HTTP \(http.statusCode) for \(url.absoluteString)")
-                return nil
+                return http.statusCode == 404 ? .notFound : .failed("HTTP \(http.statusCode)")
             }
             let decoded = try JSONDecoder().decode(Response.self, from: data)
             guard decoded.found, let results = decoded.results, !results.isEmpty else {
                 print("[AniSkip] no skip times found for MAL id \(malId) episode \(episode)")
-                return nil
+                return .notFound
             }
 
             var introStart: Double?
@@ -87,11 +104,11 @@ public enum AniSkipClient {
                     continue
                 }
             }
-            guard introStart != nil || outroStart != nil else { return nil }
-            return SkipTimes(introStart: introStart, introEnd: introEnd, outroStart: outroStart, outroEnd: outroEnd)
+            guard introStart != nil || outroStart != nil else { return .notFound }
+            return .found(SkipTimes(introStart: introStart, introEnd: introEnd, outroStart: outroStart, outroEnd: outroEnd))
         } catch {
             print("[AniSkip] request failed for MAL id \(malId) episode \(episode): \(error)")
-            return nil
+            return .failed(error.localizedDescription)
         }
     }
 }

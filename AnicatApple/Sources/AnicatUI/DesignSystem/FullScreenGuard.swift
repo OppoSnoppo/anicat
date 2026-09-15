@@ -45,6 +45,7 @@ public enum FullScreenGuard {
             let name = note.name.rawValue
             MainActor.assumeIsolated {
                 inTransition = false
+                FullScreenState.shared.isTransitioning = false
                 lastSettledAt = CFAbsoluteTimeGetCurrent()
                 PlayerLog.write("[fullscreen] \(name) pending \(wanted.map { $0 ? "enter" : "exit" } ?? "none")")
                 FullScreenState.shared.isFullScreen = self.window?.styleMask.contains(.fullScreen) ?? false
@@ -70,6 +71,7 @@ public enum FullScreenGuard {
     /// under a second; after three the flag is assumed stale.
     private static func armTransitionTimeout() {
         inTransition = true
+        FullScreenState.shared.isTransitioning = true
         let token = UUID()
         transitionToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -78,6 +80,7 @@ public enum FullScreenGuard {
             // request rather than replaying it: replaying is how a
             // refused toggle turned into a chain of refused toggles.
             inTransition = false
+            FullScreenState.shared.isTransitioning = false
             lastSettledAt = CFAbsoluteTimeGetCurrent()
             wanted = nil
             PlayerLog.write("[fullscreen] transition timed out; state \(window?.styleMask.contains(.fullScreen) == true ? "fullscreen" : "windowed")")
@@ -156,6 +159,12 @@ public enum FullScreenGuard {
 public final class FullScreenState {
     public static let shared = FullScreenState()
     public var isFullScreen = false
+    /// True from `willEnter`/`willExit` to `didEnter`/`didExit` (or the
+    /// guard's timeout). The player hides its chrome for the length of it:
+    /// AppKit animates the window over half a second while SwiftUI lays
+    /// the bars out against sizes a frame behind, so the chrome visibly
+    /// caught up after the window had ("it didn't size in time").
+    public var isTransitioning = false
     private init() {}
 }
 #else
@@ -166,6 +175,7 @@ public final class FullScreenState {
 public final class FullScreenState {
     public static let shared = FullScreenState()
     public var isFullScreen = false
+    public var isTransitioning = false
     private init() {}
 }
 #endif

@@ -61,6 +61,7 @@ pub struct RecommendationRow {
 /// A struct rather than three loose arguments because every caller that needs
 /// one needs the cache too: an uncached AniList detail fetch on the play path
 /// costs a round trip inside the window the resolve is racing against.
+#[derive(Clone)]
 pub struct Catalogs {
     pub anilist: Arc<AniListClient>,
     pub tmdb: Arc<TmdbClient>,
@@ -350,9 +351,27 @@ impl Catalogs {
             "media_detail",
             &[("id", &anilist_id.to_string()), ("type", media_type)],
         );
+        // A cached detail whose next episode has since aired is stale however
+        // young the row is. The detail TTL is an hour, so an episode that
+        // aired with the page open stayed unaired for up to that long: the
+        // page offered "Rewatch Episode 10" with 11 already out.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let still_current = |parsed: &anilist::responses::MediaResponse| {
+            parsed
+                .media
+                .as_ref()
+                .and_then(|m| m.next_airing_episode.as_ref())
+                .and_then(|n| n.airing_at)
+                .is_none_or(|at| at > now)
+        };
         if let Some(hit) = self.cache.get(&key) {
             if let Ok(parsed) = serde_json::from_value(hit) {
-                return Ok(parsed);
+                if still_current(&parsed) {
+                    return Ok(parsed);
+                }
             }
         }
         // Also check if the alternative type is cached for this ID to prevent redundant requests
@@ -363,7 +382,9 @@ impl Catalogs {
         );
         if let Some(hit) = self.cache.get(&alt_key) {
             if let Ok(parsed) = serde_json::from_value(hit) {
-                return Ok(parsed);
+                if still_current(&parsed) {
+                    return Ok(parsed);
+                }
             }
         }
         let mut vars = HashMap::new();

@@ -66,8 +66,11 @@ public struct MediaRowSkeleton: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .bottom) {
+                // `sumiHeading`, the same as the shelf it stands in for:
+                // with `.system` the placeholder header was sans and the real
+                // one serif under Sakura, and the swap showed on every load.
                 Text(title)
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.sumiHeading(size: 15, weight: .semibold))
                     .tracking(-0.2)
                     .foregroundColor(SumiTheme.foreground)
 

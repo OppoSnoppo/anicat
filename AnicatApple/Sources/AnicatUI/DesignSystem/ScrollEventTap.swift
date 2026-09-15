@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 #if os(macOS)
 import AppKit
 
@@ -79,7 +80,46 @@ public final class ScrollEventTap {
 
     private func deliver(_ cgEvent: CGEvent) {
         guard NSApp.isActive, !handlers.isEmpty, let event = NSEvent(cgEvent: cgEvent) else { return }
+        if event.phase == .began { ScrollLagProbe.gestureBegan() }
+        let start = CFAbsoluteTimeGetCurrent()
         for handler in handlers.values { handler(event) }
+        let cost = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        if event.phase == .began || cost > 2 {
+            PlayerLog.write(String(format: "[scroll] tap handlers %.2fms at phase %@ dy %.1f", cost, event.phase == .began ? "began" : "changed", event.scrollingDeltaY))
+        }
     }
+}
+
+/// Diagnostic for "a hard scroll lags before it moves" (owner, 2026-09-14):
+/// the trackpad's `began` tick, stamped by the event tap, against the first
+/// content offset change the page reports. The gap is the lag.
+@MainActor
+public enum ScrollLagProbe {
+    private static var began: CFAbsoluteTime = 0
+    private static var reported = false
+
+    static func gestureBegan() {
+        began = CFAbsoluteTimeGetCurrent()
+        reported = false
+    }
+
+    public static func contentMoved(_ page: String) {
+        guard began > 0, !reported else { return }
+        reported = true
+        PlayerLog.write(String(format: "[scroll] %@ first moved %.1fms after gesture began", page, (CFAbsoluteTimeGetCurrent() - began) * 1000))
+    }
+}
+
+public extension View {
+    /// Reports the page's first offset change of each gesture to `ScrollLagProbe`.
+    func scrollLagProbe(_ page: String) -> some View {
+        onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { _, _ in
+            ScrollLagProbe.contentMoved(page)
+        }
+    }
+}
+#else
+public extension View {
+    func scrollLagProbe(_ page: String) -> some View { self }
 }
 #endif

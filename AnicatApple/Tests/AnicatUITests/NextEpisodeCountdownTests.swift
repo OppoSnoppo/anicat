@@ -166,9 +166,29 @@ struct CountdownArmingTests {
         #expect(controller.nextEpisodeCountdown.isVisible)
     }
 
-    @Test("An outro window arms it at the window's start")
+    /// With auto-skip off the ending is being watched; a card at its start
+    /// played the next episode eight seconds into it.
+    @Test("With auto-skip off an outro window arms it after the ending")
+    func armsAfterOutroWhenWatching() {
+        let controller = makeController(nextEpisode: true)
+        controller.setAniSkipTimes(AniSkipClient.SkipTimes(
+            introStart: nil, introEnd: nil, outroStart: 1300, outroEnd: 1400
+        ))
+        controller.currentTime = 1301
+        controller.checkIntroStatus()
+        #expect(controller.nextEpisodeCountdown.phase == .idle)
+        controller.currentTime = 1405
+        controller.checkIntroStatus()
+        #expect(controller.nextEpisodeCountdown.phase == .idle)
+        controller.currentTime = 1411
+        controller.checkIntroStatus()
+        #expect(controller.nextEpisodeCountdown.isVisible)
+    }
+
+    @Test("With auto-skip on an outro window arms it at the window's start")
     func armsOnOutro() {
         let controller = makeController(nextEpisode: true)
+        controller.autoSkipEnabled = true
         controller.setAniSkipTimes(AniSkipClient.SkipTimes(
             introStart: nil, introEnd: nil, outroStart: 1300, outroEnd: 1390
         ))

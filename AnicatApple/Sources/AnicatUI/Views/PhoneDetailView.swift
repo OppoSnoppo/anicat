@@ -6,15 +6,49 @@ import SwiftUI
 /// Not `MediaDetailView`: that one is an overlay the desktop swaps in over
 /// the whole window, with its own back/forward history, a six-tab strip and
 /// a two-column body. On a phone the back gesture belongs to the
-/// `NavigationStack`, and the tab strip is two segments because Cast & Staff,
-/// Related, Discussions and More have no touch layout yet.
+/// `NavigationStack`, and the strip is four segments: the list (episodes,
+/// chapters or volumes), About, Cast, and More (related, recommendations,
+/// discussions). Cast and More were shelves inside About until 2026-09-14,
+/// which put the cast forty rows under the synopsis and left nowhere for
+/// the threads at all.
 struct PhoneDetailView: View {
     @Bindable var model: AppModel
 
     enum Section: String, CaseIterable, Identifiable {
         case episodes = "Episodes"
         case about = "About"
+        case cast = "Cast"
+        case more = "More"
         var id: String { rawValue }
+    }
+
+    @State private var showTrailer = false
+
+    /// A manga's first segment lists chapters, a light novel's lists
+    /// volumes. Same slot, same enum: the label is the only thing that
+    /// changes, and `Section` drives the picker's tags, which must not.
+    private var isManga: Bool {
+        guard let details = model.selectedMediaDetails else { return false }
+        return AppModel.isMangaFormat(details.format) || !model.selectedMangaChapters.isEmpty
+    }
+
+    /// Lnori volumes are loaded for a NOVEL-format title (`loadDetail`);
+    /// while they load the list shows a spinner rather than the empty
+    /// chapter list MangaDex would answer for a novel.
+    private var isNovel: Bool {
+        guard let details = model.selectedMediaDetails else { return false }
+        return details.format?.uppercased() == "NOVEL" || !model.novelVolumes.isEmpty
+    }
+
+    private var listLabel: String {
+        if isNovel { return "Volumes" }
+        if isManga { return "Chapters" }
+        return "Episodes"
+    }
+
+    private var hasTrailer: Bool {
+        guard let details = model.selectedMediaDetails, let id = details.trailerId else { return false }
+        return TrailerPlayer.embedURL(site: details.trailerSite, videoId: id) != nil
     }
 
     @State private var section: Section = .episodes
@@ -27,14 +61,19 @@ struct PhoneDetailView: View {
                     Hero(details: details)
 
                     Picker("", selection: $section) {
-                        ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
+                        ForEach(Section.allCases) {
+                            Text($0 == .episodes ? listLabel : $0.rawValue).tag($0)
+                        }
                     }
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 16)
 
                     switch section {
-                    case .episodes: episodeList
+                    case .episodes:
+                        if isNovel { volumeList(details) } else if isManga { chapterList(details) } else { episodeList }
                     case .about: about(details)
+                    case .cast: castGrid
+                    case .more: more(details)
                     }
                 } else if let message = model.errorMessage {
                     // Without this the page span forever on a failed fetch:
@@ -102,10 +141,186 @@ struct PhoneDetailView: View {
                 Label(details?.isFavourite == true ? "Remove from favourites" : "Add to favourites",
                       systemImage: details?.isFavourite == true ? "heart.fill" : "heart")
             }
+            if let details {
+                // The AniList page, which is the one address everyone can
+                // open; the app's own `anicat://` link means nothing to
+                // someone without it.
+                ShareLink(item: URL(string: "https://anilist.co/\(isManga ? "manga" : "anime")/\(details.id)")!,
+                          subject: Text(details.title)) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
         } label: {
             Image(systemName: "ellipsis.circle")
         }
         .disabled(details == nil)
+    }
+
+    /// Chapters open the reader (`MangaReaderView`, mounted by
+    /// `RootTabView`); a long press downloads or removes the download. The
+    /// offline state comes from the same dictionary the Mac's rows read.
+    @ViewBuilder
+    private func chapterList(_ details: HeroBanner.Details) -> some View {
+        if model.selectedMangaChapters.isEmpty {
+            Text(model.isLoading ? "Looking for chapters..." : "No chapters found.")
+                .font(.system(size: 13))
+                .foregroundStyle(SumiTheme.muted)
+                .padding(.horizontal, 16)
+                .padding(.top, 24)
+        } else {
+            LazyVStack(spacing: 0) {
+                ForEach(model.selectedMangaChapters) { chapter in
+                    let offline = model.chapterOfflineStates[chapter.id] ?? .none
+                    Button {
+                        Task {
+                            await model.openReader(
+                                title: details.title, chapter: chapter,
+                                allChapters: model.selectedMangaChapters, anilistId: details.id)
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Text("CH \(chapter.number)")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(SumiTheme.indigo)
+                                .frame(width: 64, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(chapter.title.isEmpty ? "Chapter \(chapter.number)" : chapter.title)
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(SumiTheme.foreground)
+                                    .lineLimit(1)
+                                if let group = chapter.scanlationGroup, !group.isEmpty {
+                                    Text(group)
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(SumiTheme.muted)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            offlineGlyph(offline)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        switch offline {
+                        case .stored:
+                            Button(role: .destructive) { model.deleteChapterDownload(chapter) } label: {
+                                Label("Remove Download", systemImage: "trash")
+                            }
+                        case .downloading, .exporting:
+                            EmptyView()
+                        default:
+                            Button { model.downloadChapter(chapter) } label: {
+                                Label("Download", systemImage: "arrow.down.circle")
+                            }
+                        }
+                    }
+                    Divider().overlay(SumiTheme.border)
+                }
+            }
+        }
+    }
+
+    /// Light novel volumes from Lnori: a tap opens the volume in the novel
+    /// reader, a long press keeps it (one JSON document, see
+    /// `novel_offline.rs`) or removes it.
+    @ViewBuilder
+    private func volumeList(_ details: HeroBanner.Details) -> some View {
+        if model.novelVolumes.isEmpty {
+            if model.isLoadingNovelVolumes {
+                ProgressView().frame(maxWidth: .infinity).padding(.top, 32)
+            } else {
+                Text("No volumes found for this title.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(SumiTheme.muted)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 24)
+            }
+        } else {
+            let states = model.novelVolumeStates
+            LazyVStack(spacing: 0) {
+                ForEach(model.novelVolumes, id: \.url) { volume in
+                    let offline = states[volume.url] ?? .none
+                    Button {
+                        model.openLightNovelVolume(bookURL: volume.url, title: volume.title, catalogId: details.id)
+                    } label: {
+                        HStack(spacing: 12) {
+                            // `index` is already 1-based from the engine; +1 showed
+                            // "VOL 2" beside "Volume 1".
+                            Text("VOL \(volume.index)")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(SumiTheme.indigo)
+                                .frame(width: 64, alignment: .leading)
+                            Text(volume.volumeName ?? volume.title)
+                                .font(.system(size: 14))
+                                .foregroundStyle(SumiTheme.foreground)
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            offlineGlyph(offline)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        switch offline {
+                        case .stored:
+                            Button(role: .destructive) { model.deleteNovelVolumeDownload(volume) } label: {
+                                Label("Remove Download", systemImage: "trash")
+                            }
+                        case .downloading, .exporting:
+                            EmptyView()
+                        default:
+                            Button { model.downloadNovelVolume(volume) } label: {
+                                Label("Download", systemImage: "arrow.down.circle")
+                            }
+                        }
+                    }
+                    Divider().overlay(SumiTheme.border)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func offlineGlyph(_ state: MediaDetailView.ChapterOfflineState) -> some View {
+        switch state {
+        case .stored:
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(SumiTheme.indigo)
+        case .downloading, .exporting:
+            ProgressView().controlSize(.small)
+        case .failed:
+            Image(systemName: "exclamationmark.circle")
+                .font(.system(size: 14))
+                .foregroundStyle(SumiTheme.warning)
+        case .none:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private func downloadGlyph(_ state: MediaDetailView.EpisodeDownloadState?) -> some View {
+        switch state {
+        case .done?:
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(SumiTheme.indigo)
+        case .downloading(let percent)?:
+            Text("\(Int(percent))%")
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(SumiTheme.muted)
+        case .failed?:
+            Image(systemName: "exclamationmark.circle")
+                .font(.system(size: 14))
+                .foregroundStyle(SumiTheme.warning)
+        case .notStarted?, nil:
+            EmptyView()
+        }
     }
 
     @ViewBuilder
@@ -129,11 +344,27 @@ struct PhoneDetailView: View {
                         // via `ensurePlaybackEpisodes`.
                         model.playGuardedByCellular { play(episode.number) }
                     } label: {
-                        EpisodeRow(episode: episode)
+                        HStack(spacing: 0) {
+                            EpisodeRow(episode: episode)
+                            downloadGlyph(model.downloadStates[episode.number])
+                                .padding(.trailing, 16)
+                        }
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
                         playOnMac(episode.number)
+                        // Same engine path as the Mac's per-row button; the
+                        // Downloads page under More lists the result.
+                        switch model.downloadStates[episode.number] {
+                        case .downloading?, .done?:
+                            EmptyView()
+                        default:
+                            Button {
+                                Task { await model.startDownload(episode: episode.number) }
+                            } label: {
+                                Label("Download", systemImage: "arrow.down.circle")
+                            }
+                        }
                         // The phone had no way to take a watch back. A
                         // stream that failed on open still recorded one, and
                         // the only undo lived in the Mac's History view.
@@ -199,6 +430,31 @@ struct PhoneDetailView: View {
     @ViewBuilder
     private func about(_ details: HeroBanner.Details) -> some View {
         VStack(alignment: .leading, spacing: 18) {
+            if hasTrailer {
+                Button {
+                    showTrailer = true
+                } label: {
+                    Label("Watch trailer", systemImage: "play.rectangle")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(SumiTheme.background)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(SumiTheme.indigo, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .sheet(isPresented: $showTrailer) {
+                    if let id = details.trailerId {
+                        TrailerPlayer(
+                            site: details.trailerSite, videoId: id,
+                            thumbnail: details.trailerThumbnail.flatMap(URL.init(string:)))
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                        .background(Color.black.ignoresSafeArea())
+                        .presentationDetents([.medium, .large])
+                    }
+                }
+            }
+
             if let next = details.nextEpisodeText, !next.isEmpty {
                 Text(next.uppercased())
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -235,9 +491,18 @@ struct PhoneDetailView: View {
             if let studios = details.studios, !studios.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     metaLabel("STUDIO")
-                    Text(studios.filter(\.isMain).map(\.name).joined(separator: ", "))
-                        .font(.system(size: 13))
-                        .foregroundStyle(SumiTheme.foreground)
+                    // One button per main studio: each has an AniList id and
+                    // a page of its own (`openStudio`).
+                    HStack(spacing: 8) {
+                        ForEach(studios.filter(\.isMain)) { studio in
+                            Button { model.openStudio(id: studio.id) } label: {
+                                Text(studio.name)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(SumiTheme.indigo)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
             } else if let studio = details.studio {
                 VStack(alignment: .leading, spacing: 6) {
@@ -248,68 +513,6 @@ struct PhoneDetailView: View {
                 }
             }
 
-            if !model.selectedCharacters.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    metaLabel("CAST")
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 12) {
-                            ForEach(model.selectedCharacters) { character in
-                                castCard(character).sumiShelfEdge()
-                            }
-                        }
-                    }
-                    // The row is inset from the page's own 16pt gutter, so it
-                    // has to bleed back out to the screen edge or the first
-                    // card looks indented against every other row.
-                    .padding(.horizontal, -16)
-                    .safeAreaPadding(.horizontal, 16)
-                }
-            }
-
-            if !model.selectedRecommendations.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    metaLabel("MORE LIKE THIS")
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 12) {
-                            ForEach(model.selectedRecommendations) { item in
-                                posterCard(id: item.id, title: item.title, cover: item.coverURL)
-                                    .sumiShelfEdge()
-                            }
-                        }
-                    }
-                    .padding(.horizontal, -16)
-                    .safeAreaPadding(.horizontal, 16)
-                }
-            }
-
-            if !model.selectedRelations.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    metaLabel("RELATED")
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 12) {
-                            ForEach(model.selectedRelations) { item in
-                                posterCard(
-                                    id: item.id,
-                                    title: item.title,
-                                    cover: item.coverURL,
-                                    caption: item.relationType.replacingOccurrences(of: "_", with: " ").capitalized
-                                )
-                                .sumiShelfEdge()
-                            }
-                        }
-                    }
-                    .padding(.horizontal, -16)
-                    .safeAreaPadding(.horizontal, 16)
-                }
-            }
-
-            if details.prequel != nil || details.sequel != nil {
-                VStack(alignment: .leading, spacing: 8) {
-                    metaLabel("SEASONS")
-                    if let prequel = details.prequel { relationRow("Previous", prequel) }
-                    if let sequel = details.sequel { relationRow("Next", sequel) }
-                }
-            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 4)
@@ -340,6 +543,107 @@ struct PhoneDetailView: View {
                 }
             }
         }
+    }
+
+    /// Every character with their voice actor, two across. A tap opens the
+    /// character page (`PersonPageView` over the tabs); the actor is
+    /// reachable from there.
+    @ViewBuilder
+    private var castGrid: some View {
+        if model.selectedCharacters.isEmpty {
+            Text(model.isLoading ? "Loading cast..." : "No cast listed.")
+                .font(.system(size: 13))
+                .foregroundStyle(SumiTheme.muted)
+                .padding(.horizontal, 16)
+                .padding(.top, 24)
+        } else {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], alignment: .leading, spacing: 14) {
+                ForEach(model.selectedCharacters) { character in
+                    Button { model.openCharacter(id: character.id) } label: {
+                        castCard(character)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    /// Related titles, recommendations and the AniList threads, in that
+    /// order: the first two are what the Mac's Related and More tabs hold,
+    /// the third its Discussions tab. Threads open over the page.
+    @ViewBuilder
+    private func more(_ details: HeroBanner.Details) -> some View {
+        VStack(alignment: .leading, spacing: 22) {
+            if details.prequel != nil || details.sequel != nil {
+                VStack(alignment: .leading, spacing: 8) {
+                    metaLabel("SEASONS")
+                    if let prequel = details.prequel { relationRow("Previous", prequel) }
+                    if let sequel = details.sequel { relationRow("Next", sequel) }
+                }
+            }
+            if !model.selectedRelations.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    metaLabel("RELATED")
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 12)], alignment: .leading, spacing: 14) {
+                        ForEach(model.selectedRelations) { item in
+                            posterCard(
+                                id: item.id, title: item.title, cover: item.coverURL,
+                                caption: item.relationType.replacingOccurrences(of: "_", with: " ").capitalized)
+                        }
+                    }
+                }
+            }
+            if !model.selectedRecommendations.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    metaLabel("MORE LIKE THIS")
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 12)], alignment: .leading, spacing: 14) {
+                        ForEach(model.selectedRecommendations) { item in
+                            posterCard(id: item.id, title: item.title, cover: item.coverURL)
+                        }
+                    }
+                }
+            }
+            if !model.selectedDiscussions.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    metaLabel("DISCUSSIONS")
+                    ForEach(model.selectedDiscussions) { thread in
+                        Button { model.openThread(id: thread.id) } label: {
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(thread.title)
+                                        .font(.system(size: 13.5))
+                                        .foregroundStyle(SumiTheme.foreground)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                    Text("\(thread.authorName ?? "AniList") \u{00B7} \(thread.replyCount) \(thread.replyCount == 1 ? "REPLY" : "REPLIES")")
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(SumiTheme.muted)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 8)
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(SumiTheme.muted)
+                            }
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Divider().overlay(SumiTheme.border)
+                    }
+                }
+            }
+            if model.selectedRelations.isEmpty, model.selectedRecommendations.isEmpty,
+               model.selectedDiscussions.isEmpty, details.prequel == nil, details.sequel == nil {
+                Text("Nothing related yet.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(SumiTheme.muted)
+                    .padding(.top, 8)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
     }
 
     @ViewBuilder
@@ -398,7 +702,8 @@ struct PhoneDetailView: View {
                 .foregroundStyle(SumiTheme.muted)
                 .lineLimit(1)
         }
-        .frame(width: 104, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder

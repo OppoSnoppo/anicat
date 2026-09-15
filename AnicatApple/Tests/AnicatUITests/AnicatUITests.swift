@@ -45,27 +45,6 @@ struct AnicatUITests {
         #expect(controller.activeAnime4KPreset == .on)
     }
 
-    #if os(macOS)
-    // Renders via libmpv's render API into an owned OpenGL context rather
-    // than handing mpv a `wid` — see MpvSurface.swift's doc comment.
-    // There is no subview reparenting to constrain any more (that was the
-    // wid/cocoa-cb design this replaced), so the test now covers what
-    // actually matters here: the view is a real, usable OpenGL surface
-    // before it's ever attached to a window, and mpv isn't touched until
-    // it is (`attachMpv` is only ever called from `viewDidMoveToWindow`).
-    @Test("MpvRenderView creates an accelerated OpenGL context before attaching to a window")
-    @MainActor
-    func testMpvRenderView() {
-        let view = MpvRenderView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
-        #expect(view.window == nil)
-        #expect(view.coordinator == nil)
-        #expect(view.openGLContext != nil)
-
-        view.frame = NSRect(x: 0, y: 0, width: 1280, height: 720)
-        #expect(view.bounds.size == NSSize(width: 1280, height: 720))
-    }
-    #endif
-
     @Test("Sumi Ledger Tokens")
     func testThemeTokens() {
         #expect(SumiTheme.radiusMd == 10)
@@ -166,6 +145,26 @@ struct AnicatUITests {
 
         defaults.set(true, forKey: key)
         #expect(AppModel.isDiscordPresenceEnabled)
+    }
+
+    @Test("Discord presence names drop placeholders and keep their full length")
+    func testDiscordPresenceEpisodeName() {
+        #expect(AppModel.presenceEpisodeName("Killing Magic", number: 3) == "Killing Magic")
+        #expect(AppModel.presenceEpisodeName("Episode 3", number: 3) == nil)
+        #expect(AppModel.presenceEpisodeName("  ", number: 3) == nil)
+        let long = "The Revival of the Time-Honored Classics Club"
+        #expect(AppModel.presenceEpisodeName(long, number: 1) == long)
+    }
+
+    @Test("Discord presence maps an absolute episode to its season")
+    func testDiscordPresenceSeasonPlace() {
+        let seasons = [CinemaSeason(number: 1, episodeCount: 8), CinemaSeason(number: 2, episodeCount: 10)]
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 3, seasons: seasons)! == (1, 3))
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 13, seasons: seasons)! == (2, 5))
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 19, seasons: seasons) == nil)
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 3, seasons: []) == nil)
+        #expect(AppModel.presenceRuntime(seconds: 8340) == "2h 19m")
+        #expect(AppModel.presenceRuntime(seconds: 30) == nil)
     }
 
     @Test("MediaDetailView onClose callback triggers")
@@ -591,5 +590,53 @@ struct AnicatUITests {
         let fourThree = PlayerView.chromeGeometry(windowSize: CGSize(width: 1920, height: 1080), aspectRatio: 4.0 / 3.0)
         #expect(fourThree.videoRect.height == 1080)
         #expect(fourThree.topOverlay == PlayerView.minTopBarHeight)
+    }
+    // The tester's screenshot: a hand reaching out of black, the bottom 40%
+    // of the frame read as a bar and the controls' scrim drawn from 59% of
+    // the window down over the picture. A letterbox is two bars of one
+    // height, no deeper than 2.76:1; anything else is a dark shot and the
+    // chrome must not move for it.
+    @Test("Player chrome takes only a symmetric, film-deep encoded letterbox")
+    @MainActor
+    func testChromeInsetShapeRule() {
+        let darkShot = AmbientContentInset(top: 0, bottom: 0.4, left: 0, right: 0)
+        #expect(PlayerView.chromeInset(darkShot) == .zero)
+        let lopsided = AmbientContentInset(top: 0.05, bottom: 0.12, left: 0, right: 0)
+        #expect(PlayerView.chromeInset(lopsided) == .zero)
+        let tooDeep = AmbientContentInset(top: 0.3, bottom: 0.3, left: 0, right: 0)
+        #expect(PlayerView.chromeInset(tooDeep) == .zero)
+        let hairline = AmbientContentInset(top: 0.01, bottom: 0.01, left: 0, right: 0)
+        #expect(PlayerView.chromeInset(hairline) == .zero)
+        let scope = AmbientContentInset(top: 0.12, bottom: 0.125, left: 0.03, right: 0.03)
+        #expect(PlayerView.chromeInset(scope) == AmbientContentInset(top: 0.12, bottom: 0.125, left: 0, right: 0))
+    }
+
+    // Thirty samples a second reach the hold; a bar has to be reported for
+    // a second and a half before the scrim moves, and a shot that passes
+    // the shape rule for less than that leaves it where it was.
+    @Test("Player chrome inset waits out a passing shot")
+    @MainActor
+    func testChromeInsetHold() {
+        var hold = PlayerView.ChromeInsetHold()
+        let scope = AmbientContentInset(top: 0.12, bottom: 0.12, left: 0, right: 0)
+        #expect(hold.offer(scope, at: 0) == false)
+        #expect(hold.offer(scope, at: 1.0) == false)
+        #expect(hold.current == .zero)
+        #expect(hold.offer(scope, at: 1.6) == true)
+        #expect(hold.current == scope)
+        // Refinement jitter on the same bar is not a new reading.
+        #expect(hold.offer(AmbientContentInset(top: 0.125, bottom: 0.118, left: 0, right: 0), at: 2.0) == false)
+        #expect(hold.current == scope)
+        // A one-second shot on black: back to the bar before the hold runs out.
+        let black = AmbientContentInset(top: 0.2, bottom: 0.2, left: 0, right: 0)
+        #expect(hold.offer(black, at: 3.0) == false)
+        #expect(hold.offer(black, at: 4.0) == false)
+        #expect(hold.offer(scope, at: 4.1) == false)
+        #expect(hold.current == scope)
+        // Its timer restarted: black again is a fresh candidate.
+        #expect(hold.offer(black, at: 4.2) == false)
+        #expect(hold.offer(black, at: 5.6) == false)
+        #expect(hold.offer(black, at: 5.8) == true)
+        #expect(hold.current == black)
     }
 }

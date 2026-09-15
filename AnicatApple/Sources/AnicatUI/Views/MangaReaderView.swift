@@ -56,6 +56,11 @@ public struct MangaReaderView: View {
     /// arbitrary page inside it, so `onPageChanged` keeps meaning the same
     /// thing to the Handoff advertisement in every mode.
     @State private var currentPageIndex: Int = 0
+    /// A page the scrubber asked the webtoon column to scroll to. Its own
+    /// value rather than `currentPageIndex`: rows write that on appear as
+    /// they scroll past, and scrolling to it on every write fought the
+    /// reader's own scrolling.
+    @State private var webtoonJump: Int?
     @State private var readingMode: ReadingMode
     @State private var readingDirection: ReadingDirection
     @State private var offsetCover: Bool
@@ -476,6 +481,25 @@ public struct MangaReaderView: View {
                                 .contentShape(Rectangle())
                                 .onTapGesture { turnPage(forward: readingDirection == .ltr) }
                         }
+                        // A horizontal swipe turns the page on the phone.
+                        // The Mac gets this from `TrackpadSwipeMonitor`,
+                        // which is an NSEvent monitor and a no-op here, so
+                        // without this the only page turn on a phone was
+                        // the outer-third tap. 40pt so a pinch that drifts
+                        // sideways does not also turn a page.
+                        #if os(iOS)
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 40)
+                                .onEnded { value in
+                                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                                    let swipedLeft = value.translation.width < 0
+                                    // Swiping left pulls the next page in from
+                                    // the right in LTR; in RTL the next page is
+                                    // on the left, so the same swipe goes back.
+                                    turnPage(forward: swipedLeft == (readingDirection == .ltr))
+                                }
+                        )
+                        #endif
                     }
                 }
                 // `initial: true` warms the window for the page the reader
@@ -657,6 +681,17 @@ public struct MangaReaderView: View {
 
     // MARK: - Webtoon (Continuous Vertical) View
     private func webtoonView(fit: ImageFit) -> some View {
+        ScrollViewReader { proxy in
+            webtoonColumn(fit: fit)
+                .onChange(of: webtoonJump) { _, page in
+                    guard let page else { return }
+                    proxy.scrollTo(page, anchor: .top)
+                    webtoonJump = nil
+                }
+        }
+    }
+
+    private func webtoonColumn(fit: ImageFit) -> some View {
         ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(spacing: 0) {
                 ForEach(Array(pageURLs.enumerated()), id: \.offset) { index, url in
@@ -779,11 +814,12 @@ public struct MangaReaderView: View {
 
             Spacer()
 
-            // Fullscreen Toggle Button
+            // Fullscreen Toggle Button. macOS only: on the phone the reader
+            // already fills the screen, and the button rendered with an
+            // empty action.
+            #if os(macOS)
             Button(action: {
-                #if os(macOS)
                 if let window = NSApp.keyWindow ?? NSApp.mainWindow { FullScreenGuard.toggle(on: window) }
-                #endif
             }) {
                 Image(systemName: "arrow.up.left.and.arrow.down.right")
                     .font(.system(size: 13))
@@ -794,6 +830,7 @@ public struct MangaReaderView: View {
             }
             .buttonStyle(.sumiPressable)
             .padding(.trailing, 4)
+            #endif
 
             // Only meaningful while pages are being paired, and a toggle that
             // changes nothing visible is worse than an absent one.
@@ -889,6 +926,63 @@ public struct MangaReaderView: View {
         return "Page \(first + 1) / \(total)"
     }
 
+    /// A page bar under the readout: drag or click to jump. The readout
+    /// alone said where the reader was and offered no way to move except
+    /// one page at a time, so a re-read of one scene forty pages back was
+    /// forty key presses.
+    ///
+    /// Runs the reading direction: right-to-left manga fills from the right,
+    /// so the bar's motion matches the pages'.
+    private var pageScrubber: some View {
+        let total = max(pageURLs.count, 1)
+        let fraction = Double(visiblePages.last ?? currentPageIndex) + 1
+        let rtl = readingDirection == .rtl && readingMode != .webtoon
+        return GeometryReader { geo in
+            ZStack(alignment: rtl ? .trailing : .leading) {
+                Capsule()
+                    .fill(SumiTheme.foregroundWash)
+                Capsule()
+                    .fill(SumiTheme.indigo)
+                    .frame(width: geo.size.width * CGFloat(fraction / Double(total)))
+            }
+            .frame(height: 3)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            // `DragGesture` is not in the tvOS SDK; the bar is read-only
+            // there and the remote turns pages.
+            #if !os(tvOS)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        var x = value.location.x / max(geo.size.width, 1)
+                        if rtl { x = 1 - x }
+                        let page = min(max(Int((x * Double(total)).rounded(.down)), 0), total - 1)
+                        jump(to: page)
+                    }
+            )
+            #endif
+        }
+        .frame(height: 16)
+    }
+
+    /// Opens `page` directly. In `.double` it lands on the spread holding
+    /// the page; in `.webtoon` the column scrolls there (see `webtoonView`).
+    private func jump(to page: Int) {
+        var target = page
+        if readingMode == .double {
+            let spreads = currentSpreads
+            if !spreads.isEmpty {
+                target = spreads[Self.spreadIndex(containing: page, spreads: spreads)][0]
+            }
+        }
+        guard target != currentPageIndex else { return }
+        lastTurnWasForward = target > currentPageIndex
+        withAnimation(pageAnimation) { currentPageIndex = target }
+        if readingMode == .webtoon { webtoonJump = target }
+        onPageChanged(target)
+        noteReadingPosition(target)
+    }
+
     // MARK: - Bottom Bar
     private var bottomBar: some View {
         HStack(spacing: 16) {
@@ -901,9 +995,13 @@ public struct MangaReaderView: View {
 
             Spacer()
 
-            Text(pageReadout)
-                .sumiTabularMono(size: 12, weight: .medium)
-                .foregroundColor(SumiTheme.foreground)
+            VStack(spacing: 6) {
+                Text(pageReadout)
+                    .sumiTabularMono(size: 12, weight: .medium)
+                    .foregroundColor(SumiTheme.foreground)
+                pageScrubber
+            }
+            .frame(maxWidth: 360)
 
             Spacer()
 

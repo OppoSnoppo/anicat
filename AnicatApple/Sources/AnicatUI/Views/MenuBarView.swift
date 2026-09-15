@@ -126,7 +126,7 @@ public struct MenuBarView: View {
                         .renderingMode(.template)
                         .foregroundColor(SumiTheme.indigo)
                 } else {
-                    Image(systemName: "cat.fill")
+                    Image(systemName: "pawprint.fill")
                         .foregroundColor(SumiTheme.indigo)
                 }
                 Text("Anicat")

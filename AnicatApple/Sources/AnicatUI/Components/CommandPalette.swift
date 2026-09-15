@@ -94,7 +94,15 @@ public struct CommandPalette: View {
             .shadow(color: .black.opacity(0.5), radius: 30, y: 12)
             .padding(.top, 140)
         }
-        .onAppear { fieldFocused = true }
+        // Asked again a beat after appearing: from `onAppear` alone the
+        // write was dropped, because the palette is inserted inside the
+        // `.snappy` transaction before its field is in the window. Cmd+K
+        // opened a palette that took no typing until the box was clicked.
+        .task {
+            fieldFocused = true
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            if !fieldFocused { fieldFocused = true }
+        }
         .sumiExitCommand(perform: onDismiss)
         // `.task(id:)` cancels the previous debounce automatically when
         // `query` changes again — same pattern as the Search tab's own

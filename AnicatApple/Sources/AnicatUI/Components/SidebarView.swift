@@ -234,10 +234,10 @@ public struct SidebarView: View {
 
             // Bottom Logo & Search Button
             VStack(spacing: 12) {
-                // The actual mark, not a glyph that resembles one: `h-20`
-                // (80pt), grayscaled, at `opacity-10`. An SF Symbol cat is a
+                // The actual mark, not a glyph that resembles one: 80pt,
+                // grayscaled, at 10% opacity. SF Symbols' `pawprint` is a
                 // different drawing at a different weight and reads as a
-                // placeholder next to the real logo.
+                // placeholder next to the app icon's paw.
                 Group {
                     if switchModeCaption != nil || switchModeLocked {
                         Button(action: onSwitchMode) { modeMark }

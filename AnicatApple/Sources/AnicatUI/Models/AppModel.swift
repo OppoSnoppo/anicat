@@ -37,10 +37,11 @@ public enum PersonPage: Equatable, Hashable, Identifiable, Sendable {
 @Observable
 @MainActor
 public final class AppModel {
-    // Progress/Discord IPC calls (recordProgress, discordSetPresence,
-    // discordClearPresence) are synchronous FFI writes that can stall for as
-    // long as SQLite or Discord's own read side does — see the notes on
-    // `handlePlaybackPositionChange` and `stopPlayback`. Each call used to
+    // Progress writes (recordProgress) are synchronous FFI calls that can
+    // stall for as long as SQLite does — see the notes on
+    // `handlePlaybackPositionChange` and `stopPlayback`. Discord presence
+    // used to go through here too; the engine's own worker thread owns that
+    // socket now, and its calls return at once. Each call used to
     // get its own unstructured `Task.detached`, which fixed the main-thread
     // freeze but not ordering: a per-second tick spawns roughly one of these
     // a second, and if an earlier tick's task is the one that stalls, a
@@ -51,7 +52,7 @@ public final class AppModel {
     // land in the order they were issued.
     let engineIOQueue = DispatchQueue(label: "com.anicat.engine-io", qos: .utility)
 
-    /// Blocks until every progress/Discord write queued so far has run.
+    /// Blocks until every progress write queued so far has run.
     /// For tests that read the registry right after a position tick: the
     /// writes are deliberately asynchronous (see the queue's comment) and
     /// a synchronous read raced them, failing about two runs in three once
@@ -405,12 +406,28 @@ public final class AppModel {
     /// label immediately rather than waiting for the next second to tick
     /// over, since `pause()`/`play()` re-report the same truncated position.
     var lastDiscordPaused: Bool?
+    /// When the open reading session began, shown on Discord as elapsed
+    /// time. Per session rather than per chapter, so turning to the next
+    /// chapter does not reset the clock.
+    @ObservationIgnored var readingPresenceStartedAt: Date?
     // Guards the AniList auto-advance below to one attempt per episode
     // rather than once a second for the rest of the episode once past 85%.
     var hasAdvancedAniListForCurrentEpisode = false
     // Same idea, for auto-play-next: one attempt per episode once past the
     // near-end line below.
     var hasAutoAdvancedEpisode = false
+    /// Once per episode: the auto-next gates, logged as the episode enters
+    /// its last 30 seconds. "Autoplay is on and nothing happened" came with
+    /// no line in the log to say which of six conditions said no.
+    var hasLoggedAutoNextGates = false
+    /// Wakes when the earliest scheduled episode airs; see
+    /// `armScheduleRollover`.
+    var scheduleRolloverTask: Task<Void, Never>?
+    /// Opening/ending detection for the playing episode; cancelled with it.
+    var skipDetectionTask: Task<Void, Never>?
+    /// The next episode's stream once the 75% preload has it, for the audio
+    /// comparison that finds a show's opening the first time.
+    var preloadedNextStream: (catalogId: Int64, episode: Int64, url: String)?
 
     // One speculative resolve of the next episode per episode session, see
     // `nextEpisodePreloadPct`.
@@ -796,9 +813,20 @@ public final class AppModel {
         return defaults.bool(forKey: discordPresenceKey)
     }
 
-    /// Last value acted on, so the observer below can tell a change to this
-    /// key from the many other keys `didChangeNotification` fires for.
+    /// Settings' "Show on profile" choice, `"full"` or `"private"`. A second
+    /// key rather than a third state on the switch: the switch is a `Bool`
+    /// in `@AppStorage` in two views, and a `String` read through either
+    /// would silently answer false.
+    public nonisolated static let discordPresenceDetailKey = "anicat_discord_presence_detail"
+
+    public static var discordPresenceDetail: DiscordPresenceDetail {
+        UserDefaults.standard.string(forKey: discordPresenceDetailKey) == "private" ? .private : .full
+    }
+
+    /// Last values acted on, so the observer below can tell a change to these
+    /// keys from the many other keys `didChangeNotification` fires for.
     private var lastDiscordPresenceEnabled = AppModel.isDiscordPresenceEnabled
+    private var lastDiscordPresenceDetail = AppModel.discordPresenceDetail
     // `nonisolated(unsafe)`: `deinit` is nonisolated and has to reach it.
     // Written once from `init` on the main actor, read once in deinit.
     @ObservationIgnored private nonisolated(unsafe) var defaultsObserver: NSObjectProtocol?
@@ -820,6 +848,11 @@ public final class AppModel {
             // build was green here and red there until this was spelled out.
             MainActor.assumeIsolated {
                 guard let self else { return }
+                let detail = AppModel.discordPresenceDetail
+                if detail != self.lastDiscordPresenceDetail {
+                    self.lastDiscordPresenceDetail = detail
+                    self.engine?.discordSetDetail(detail: detail)
+                }
                 let enabled = AppModel.isDiscordPresenceEnabled
                 guard enabled != self.lastDiscordPresenceEnabled else { return }
                 self.lastDiscordPresenceEnabled = enabled
@@ -834,19 +867,16 @@ public final class AppModel {
         }
     }
 
-    /// Connects or disconnects Discord to match the setting. Turning it off
-    /// mid-episode has to clear what is already showing, not just stop
-    /// future updates: `discordDisconnect` drops the IPC socket, which is
-    /// what makes the activity disappear from the profile.
+    /// Connects or disconnects Discord to match the setting. Both return at
+    /// once; the engine's presence worker does the socket work. The engine
+    /// keeps the wanted presence while off, so switching back on mid-episode
+    /// shows it again without waiting for the next change.
     func applyDiscordPresenceSetting(_ enabled: Bool) {
         guard let engine else { return }
-        engineIOQueue.async {
-            if enabled {
-                engine.discordConnect()
-            } else {
-                engine.discordClearPresence()
-                engine.discordDisconnect()
-            }
+        if enabled {
+            engine.discordConnect()
+        } else {
+            engine.discordDisconnect()
         }
     }
 
@@ -909,7 +939,9 @@ public final class AppModel {
         do {
             let dataDir = try Self.makeEngineDataDirectory()
 
-            // Zero-Login iCloud Sync: retrieve token from iCloud Keychain if not explicitly provided
+            // config.json first, then the Tauri build's config.toml, then the
+            // Keychain -- see `iCloudSyncService.getAniListToken` for why
+            // the Keychain is last.
             let token = anilistToken ?? iCloudSyncService.shared.getAniListToken()
 
             let coreEngine = try AnicatEngine(
@@ -925,6 +957,7 @@ public final class AppModel {
             )
             self.engine = coreEngine
             self.cinemaAvailable = coreEngine.hasTmdbKey()
+            Self.excludeCachesFromBackup(dataDir: dataDir)
             // A mode the viewer left the app in is only restorable while it
             // still exists: a build with no key must not open onto eight
             // shelves that cannot load.
@@ -955,8 +988,10 @@ public final class AppModel {
             // of every app session, after it that number is ~0.
             let warmUp = Task.detached(priority: .utility) { await coreEngine.warmUp() }
 
-            // A no-op when Discord isn't running — the IPC connect just fails
-            // and logs a warning on the Rust side.
+            // Returns at once whether or not Discord is running; the engine
+            // retries the connection for as long as presence stays on.
+            lastDiscordPresenceDetail = Self.discordPresenceDetail
+            coreEngine.discordSetDetail(detail: lastDiscordPresenceDetail)
             lastDiscordPresenceEnabled = Self.isDiscordPresenceEnabled
             if lastDiscordPresenceEnabled {
                 coreEngine.discordConnect()

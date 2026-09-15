@@ -451,7 +451,7 @@ struct AnicatApp: App {
             if let icon = BrandAssets.menuBarIcon {
                 icon
             } else {
-                Image(systemName: "cat.fill")
+                Image(systemName: "pawprint.fill")
             }
         }
         .menuBarExtraStyle(.window)
@@ -470,12 +470,28 @@ struct AnicatApp: App {
 @main
 struct AnicatApp: App {
     @State private var model: AppModel
+    // For `supportedInterfaceOrientationsFor` and nothing else; see
+    // `OrientationLock`. A television does not turn.
+    #if os(iOS)
+    @UIApplicationDelegateAdaptor(AnicatAppDelegate.self) private var delegate
+    #endif
 
     init() {
         AppLog.start()
         let model = AppModel()
         _model = State(initialValue: model)
         model.registerAsShared()
+    }
+
+    /// See `IOSIntegrations.swift` for why this is compiled only under
+    /// the Xcode target.
+    @ViewBuilder
+    private var iosIntegrations: some View {
+        #if ANICAT_XCODE
+        IOSIntegrations(model: model)
+        #else
+        EmptyView()
+        #endif
     }
 
     var body: some Scene {
@@ -498,10 +514,6 @@ struct AnicatApp: App {
                 // `RootView` has no other interest in studios.
                 .environment(\.studioPageActions, model.studioPageActions)
                 .task {
-                    // Before `initialize`, which is slow: a Live Activity
-                    // left running by a previous launch is already on the
-                    // lock screen, and its buttons reach this process the
-                    // moment it exists.
                     await model.initialize()
                     model.drainPendingDeepLink()
                     if let path = ProcessInfo.processInfo.environment["ANICAT_DEBUG_PLAY_FILE"] {
@@ -516,6 +528,7 @@ struct AnicatApp: App {
                     model.handleOpenURL(url)
                 }
                 .background(SystemIntegrationObserver(model: model))
+                .background(iosIntegrations)
         }
     }
 }

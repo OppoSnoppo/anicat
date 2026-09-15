@@ -1,23 +1,19 @@
 import Foundation
 import Security
 
+/// The AniList token's three homes, in the order they are read. The name
+/// is historical: this once also wrapped `NSUbiquitousKeyValueStore` for
+/// resume positions, which nothing ever called and which needs an iCloud
+/// entitlement neither app target carries -- on iOS the store logged a
+/// missing-entitlement complaint at every launch for a feature that did
+/// not exist. The token itself never went through iCloud.
 public final class iCloudSyncService: @unchecked Sendable {
     public static let shared = iCloudSyncService()
 
-    private let kvStore = NSUbiquitousKeyValueStore.default
     private let serviceName = "com.anicat.auth"
     private let tokenAccount = "anilist_oauth_token"
 
-    private init() {
-        NotificationCenter.default.addObserver(
-            forName: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: kvStore,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handleRemoteStoreChange()
-        }
-        kvStore.synchronize()
-    }
+    private init() {}
 
     // MARK: - Local Keychain & Config File (Zero-Login OAuth Token Persistence)
 
@@ -246,32 +242,5 @@ public final class iCloudSyncService: @unchecked Sendable {
         let range = NSRange(location: 0, length: (contents as NSString).length)
         let updated = regex.stringByReplacingMatches(in: contents, options: [], range: range, withTemplate: "anilist_token = \"\"")
         try? updated.write(to: fileURL, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Ubiquitous Key-Value Store (Resume History & Preferences)
-
-    public func saveResumePosition(catalogId: Int64, episode: Int, positionSeconds: Double) {
-        let key = "resume_\(catalogId)_\(episode)"
-        kvStore.set(positionSeconds, forKey: key)
-        kvStore.synchronize()
-    }
-
-    public func getResumePosition(catalogId: Int64, episode: Int) -> Double? {
-        let key = "resume_\(catalogId)_\(episode)"
-        let val = kvStore.double(forKey: key)
-        return val > 0 ? val : nil
-    }
-
-    public func setSetting<T>(_ value: T, forKey key: String) {
-        kvStore.set(value, forKey: key)
-        kvStore.synchronize()
-    }
-
-    public func getSetting<T>(forKey key: String) -> T? {
-        kvStore.object(forKey: key) as? T
-    }
-
-    private func handleRemoteStoreChange() {
-        print("[iCloudSync] Remote settings / resume markers updated from another Apple device.")
     }
 }

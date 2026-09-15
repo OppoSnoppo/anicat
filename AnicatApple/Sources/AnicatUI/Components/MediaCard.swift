@@ -44,6 +44,12 @@ public struct MediaCard: View, Equatable {
         /// The AniList list entry behind this card, when it is on the
         /// viewer's list. What a shelf's "Remove from list" deletes by.
         public var listEntryId: Int64? = nil
+        /// AniList's format string (`TV`, `MOVIE`, `MANGA`, ...), for the
+        /// hover badge. Optional and defaulted so a `HomeCache` snapshot
+        /// written before the field existed still decodes.
+        public var format: String? = nil
+        /// Still airing or publishing, for the hover badge.
+        public var isAiring: Bool = false
 
         public init(
             id: Int64,
@@ -56,7 +62,9 @@ public struct MediaCard: View, Equatable {
             hasNewEpisode: Bool = false,
             playlistReason: String? = nil,
             catalog: CardCatalog? = nil,
-            listEntryId: Int64? = nil
+            listEntryId: Int64? = nil,
+            format: String? = nil,
+            isAiring: Bool = false
         ) {
             self.id = id
             self.title = title
@@ -69,6 +77,8 @@ public struct MediaCard: View, Equatable {
             self.playlistReason = playlistReason
             self.catalog = catalog
             self.listEntryId = listEntryId
+            self.format = format
+            self.isAiring = isAiring
         }
     }
 
@@ -82,6 +92,13 @@ public struct MediaCard: View, Equatable {
     public var onPrefetch: (() -> Void)?
 
     @State private var isHovered = false
+    /// Where the press that opened this card landed, and a counter that
+    /// bumps on every such press — `rippleOnPress` reads both to centre and
+    /// re-fire the Metal ripple. A `SpatialTapGesture` alongside the card's
+    /// `Button` rather than reading the button's own press location: a
+    /// `ButtonStyle` configuration carries `isPressed` but no coordinate.
+    @State private var ripplePressLocation: CGPoint = .zero
+    @State private var ripplePressCount = 0
 
     public init(
         item: Item,
@@ -147,6 +164,28 @@ public struct MediaCard: View, Equatable {
                         .background(SumiTheme.card)
                         .clipped()
 
+                    // What the card is, on hover only: format, length and
+                    // whether it is still going. The text rows below stay
+                    // the two lines they are; a third row of badges on every
+                    // card made a shelf read as a table.
+                    if isHovered {
+                        HStack(spacing: 4) {
+                            if let format = item.format {
+                                StatusBadge(.format(format.replacingOccurrences(of: "_", with: " ")))
+                            }
+                            if let total = item.totalEpisodesOrChapters, total > 0 {
+                                StatusBadge(.neutral("\(total) \(item.isManga ? "ch" : "ep")"))
+                            }
+                            if item.isAiring {
+                                StatusBadge(.status(item.isManga ? "publishing" : "airing"))
+                            }
+                        }
+                        .padding(6)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .allowsHitTesting(false)
+                        .transition(.opacity.combined(with: .offset(y: -4)))
+                    }
+
                     // Hover Dim Overlay with Centered Action Button
                     ZStack {
                         Color.black.opacity(isHovered ? 0.5 : 0.0)
@@ -170,7 +209,10 @@ public struct MediaCard: View, Equatable {
                     // `.poster-tick` (index.css:549): 3px, an accent fill over a
                     // black 45% track. The track is what makes it legible on a
                     // bright poster — the fill alone vanishes into pale art.
-                    if let progress = item.progress, let total = item.totalEpisodesOrChapters, total > 0 {
+                    // Only once there is progress to show: at zero the track
+                    // alone was a dark strip along the bottom of every
+                    // Planning poster, read as a ledge the card never had.
+                    if let progress = item.progress, progress > 0, let total = item.totalEpisodesOrChapters, total > 0 {
                         let pct = min(max(CGFloat(progress) / CGFloat(total), 0), 1)
                         // scaleEffect instead of GeometryReader: this bar lives inside
                         // MediaCard, the most-instantiated view in the app, and a
@@ -179,9 +221,7 @@ public struct MediaCard: View, Equatable {
                         ZStack(alignment: .leading) {
                             Rectangle()
                                 .fill(Color.black.opacity(0.45))
-                            Rectangle()
-                                .fill(SumiTheme.indigo)
-                                .scaleEffect(x: pct, y: 1, anchor: .leading)
+                            AnimatedProgressFill(pct: pct)
                         }
                         .frame(maxWidth: .infinity)
                         .frame(height: 3)
@@ -192,6 +232,10 @@ public struct MediaCard: View, Equatable {
                     RoundedRectangle(cornerRadius: SumiTheme.radiusMd)
                         .stroke(SumiTheme.border, lineWidth: 1)
                 )
+                // On top of the poster morph, not instead of it: the ripple
+                // is a layer effect over whatever frame the poster is
+                // currently in, morphing or not.
+                .rippleOnPress(at: ripplePressLocation, trigger: ripplePressCount)
                 .ifLet(namespace) { view, namespace in
                     view.matchedGeometryEffect(id: item.id, in: namespace)
                 }
@@ -267,10 +311,86 @@ public struct MediaCard: View, Equatable {
         }
         .buttonStyle(.sumiPressable)
         .contentShape(Rectangle())
+        // `simultaneousGesture` rather than replacing the tap: the ripple
+        // needs the press location, but this must never be the gesture
+        // that decides whether `onSelect` fires — that stays the Button's.
+        .sumiSpatialTap { location in
+            ripplePressLocation = location
+            ripplePressCount += 1
+        }
         .stableHover { hovering in
             isHovered = hovering
             if hovering {
                 onPrefetch?()
+            }
+        }
+    }
+}
+
+/// The `.poster-tick` fill, animated with a small overshoot past its target
+/// on every increase instead of jumping straight there — a watched episode
+/// landing should read as a tick forward, not a redraw.
+///
+/// `keyframeAnimator(initialValue:trigger:)` restarts from the literal
+/// `initialValue` argument every time `trigger` changes, not from wherever
+/// the interpolation currently sits — so `initialValue: pct` (the *new*
+/// value) made the bar snap straight to its target on the same frame the
+/// retrigger fired and then overshoot from there, which is the linear jump
+/// this was meant to remove, with a twitch stapled on. `settledPct` is kept
+/// one step behind on purpose: it only catches up to `pct` after the
+/// animation that was chasing the old target has actually finished, so the
+/// next `keyframeAnimator` restart still has the true old value to animate
+/// from.
+private struct AnimatedProgressFill: View {
+    let pct: CGFloat
+
+    @State private var settledPct: CGFloat = 0
+    @State private var trigger = 0
+    /// Whether the in-flight (or next) keyframe track should overshoot.
+    /// Only an increase gets the tick-forward flourish; a decrease (a
+    /// progress reset) still has to reach `pct` visually, so it still bumps
+    /// `trigger`, just along a plain settle with nothing to overshoot past.
+    @State private var isIncrease = true
+
+    var body: some View {
+        Group {
+            if MotionPolicy.reduce {
+                // The web's `.poster-tick` never overshot; this branch exists
+                // only because Reduce Motion asks for *less* movement, not a
+                // jump-cut, so a plain house curve stands in for the
+                // keyframe track rather than disabling animation outright.
+                Rectangle()
+                    .fill(SumiTheme.indigo)
+                    .scaleEffect(x: pct, y: 1, anchor: .leading)
+                    .animation(.sumi(.pop), value: pct)
+            } else {
+                Rectangle()
+                    .fill(SumiTheme.indigo)
+                    .keyframeAnimator(initialValue: settledPct, trigger: trigger) { content, value in
+                        content.scaleEffect(x: value, y: 1, anchor: .leading)
+                    } keyframes: { _ in
+                        if isIncrease {
+                            CubicKeyframe(min(pct + 0.04, 1.0), duration: 0.4)
+                            SpringKeyframe(pct, duration: 0.2)
+                        } else {
+                            CubicKeyframe(pct, duration: 0.25)
+                        }
+                    }
+            }
+        }
+        .onAppear { settledPct = pct }
+        .onChange(of: pct) { oldValue, newValue in
+            guard newValue != oldValue else { return }
+            isIncrease = newValue > oldValue
+            trigger += 1
+            // Matches the keyframe track's own total duration above (0.6s
+            // overshoot, 0.25s plain settle) — updating `settledPct` any
+            // sooner hands the *next* restart a starting value the current
+            // animation hasn't visually reached yet, which is the same bug
+            // this whole struct exists to avoid, just moved one step later.
+            let settleDelay = isIncrease ? 0.6 : 0.25
+            DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) {
+                settledPct = newValue
             }
         }
     }

@@ -512,10 +512,40 @@ public final class ThemeStore: @unchecked Sendable {
         skin.palette(isLight: appearance.isLight(systemIsDark: Self.systemPrefersDark))
     }
 
-    /// Sets the app-wide accent, or clears it back to the palette's own.
-    /// Nothing calls this yet; it is the poster-accent hook.
+    /// Spelled literally at the `@AppStorage` in Settings too.
+    public static let posterAccentKey = "anicat_poster_accent"
+
+    /// Who set the accent in force: the detail page's cover URL. The page
+    /// is remounted (`.id(details.id)`) on every title change, and nothing
+    /// orders the outgoing page's `onDisappear` against the incoming page's
+    /// `task`, so an unkeyed clear on disappear could wipe the accent the
+    /// next title had just set. A clear names its owner and is ignored when
+    /// someone else has taken over.
+    private var accentOwner: String?
+
+    /// `owner` is the page in force now, and this is its accent: nil means
+    /// the palette's own. A page with a grey cover takes over just like a
+    /// colourful one; before, a nil from a new page was read as a release
+    /// and ignored, and the previous title's colour stayed on it.
     @MainActor
-    public func setAccentOverride(_ color: Color?) {
+    public func setAccentOverride(_ color: Color?, owner: String) {
+        PlayerLog.write("[accent] \(color == nil ? "set none" : "set") by \(owner.suffix(40)); owner was \(accentOwner?.suffix(40) ?? "none")")
+        accentOwner = owner
+        apply(color)
+    }
+
+    /// The page `owner` is gone. Clears the accent only while it is still
+    /// the one in force: see `accentOwner`.
+    @MainActor
+    public func releaseAccentOverride(owner: String) {
+        PlayerLog.write("[accent] release by \(owner.suffix(40)); owner was \(accentOwner?.suffix(40) ?? "none")")
+        guard accentOwner == owner else { return }
+        accentOwner = nil
+        apply(nil)
+    }
+
+    @MainActor
+    private func apply(_ color: Color?) {
         guard palette.accentOverride != nil || color != nil else { return }
         withAnimation(.sumi(.tab)) {
             palette.accentOverride = color

@@ -226,6 +226,7 @@ extension AppModel {
     public func closeSyosetuReader() {
         syosetuSession = nil
         novelReaderOpen = false
+        endReadingPresence()
     }
 
     func loadSyosetuInfo(url: String) async {
@@ -294,6 +295,14 @@ extension AppModel {
             syosetuSession?.chapterText = chapter.text
             syosetuSession?.chapterImages = chapter.images
             syosetuSession?.isLoading = false
+            let novelTitle = syosetuSession?.info?.title ?? chapter.title
+            publishReadingPresence(
+                title: novelTitle,
+                subtitle: chapter.title == novelTitle ? "" : chapter.title,
+                medium: session.source == .lnori ? "a light novel" : "a web novel",
+                anilistId: session.catalogId,
+                fallbackLink: session.source == .syosetu ? ("Read on Syosetu", sourceURL) : nil
+            )
             NovelPreferences.setLastNovel(
                 url: sourceURL,
                 title: syosetuSession?.info?.title ?? chapter.title,
@@ -320,6 +329,46 @@ extension AppModel {
         // and the bridge's task handles are only safe to touch there.
         Task { @MainActor in ReaderBridge.shared.close() }
         ContinuityManager.shared.stopAdvertising()
+        endReadingPresence()
+    }
+
+    /// Hands what is being read to the engine's Discord presence worker, in
+    /// the reading slot: a playing mini-player keeps the profile until it
+    /// stops, and then this shows. Chapter changes only; a page turn is not
+    /// something the profile shows, and Discord rate-limits writes.
+    func publishReadingPresence(
+        title: String,
+        subtitle: String,
+        medium: String,
+        anilistId: Int64?,
+        hover: String? = nil,
+        fallbackLink: (label: String, url: String)? = nil
+    ) {
+        guard let engine else { return }
+        let startedAt = readingPresenceStartedAt ?? Date()
+        readingPresenceStartedAt = startedAt
+        let cover = anilistId.flatMap { id in
+            (selectedMediaDetails?.id == id ? selectedMediaDetails?.coverURL : nil) ?? knownCovers[id]
+        }
+        let link = anilistId.map { ("View on AniList", "https://anilist.co/manga/\($0)") } ?? fallbackLink
+        engine.discordUpdate(presence: DiscordPresence(
+            source: .reading,
+            medium: medium,
+            title: title,
+            subtitle: subtitle,
+            hoverText: hover,
+            coverUrl: cover?.absoluteString,
+            linkLabel: link?.0,
+            linkUrl: link?.1,
+            positionSecs: Int64(Date().timeIntervalSince(startedAt)),
+            durationSecs: 0,
+            paused: false
+        ))
+    }
+
+    func endReadingPresence() {
+        readingPresenceStartedAt = nil
+        engine?.discordClearPresence(source: .reading)
     }
 
     public func nextChapter() async {
@@ -431,6 +480,14 @@ extension AppModel {
                 title: title,
                 chapter: chapter.number,
                 pageIndex: startPage
+            )
+            publishReadingPresence(
+                title: title,
+                subtitle: Self.presenceEpisodeName(chapter.title, number: Int(chapter.number) ?? -1)
+                    .map { "Ch. \(chapter.number) · \($0)" } ?? "Chapter \(chapter.number)",
+                medium: "manga",
+                anilistId: anilistId,
+                hover: allChapters.isEmpty ? nil : "\(title) · Chapter \(chapter.number)"
             )
         } catch {
             errorMessage = "Could not load chapter pages: \(error.localizedDescription)"

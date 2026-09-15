@@ -26,7 +26,11 @@ public final class PlayerKeyMonitor {
     /// `isSkipKey` is Return or S. Answers whether to consume the event —
     /// false passes it on, so a key that did nothing here still reaches the
     /// app-wide monitor.
-    public var onKey: ((_ isSkipKey: Bool) -> Bool)?
+    /// `isReturn` is Return or keypad Enter on its own: the next-episode
+    /// card's default action. Passed separately from `isSkipKey` (which
+    /// Return also is) because the card and the skip pill answer the same
+    /// key differently, and the card came first.
+    public var onKey: ((_ isSkipKey: Bool, _ isReturn: Bool) -> Bool)?
     /// J and L: 30 seconds back and forward, 60 with Shift. Runs after
     /// `onKey` has declined the press, so a key that dismissed the
     /// next-episode card still seeks, the same way it would still play or
@@ -83,7 +87,15 @@ public final class PlayerKeyMonitor {
         // as anyone pressing it is concerned.
         let isReturn = event.keyCode == 36 || event.keyCode == 76
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
-        if onKey?(isReturn || chars == "s") ?? false {
+        // Seeking and pausing never reach `onKey`, so they never count as
+        // "not now" for the next-episode card. Skipping to the end with the
+        // arrow keys cancelled the card on the first press, and a cancelled
+        // card is a decision AppModel respects: the episode reached its end
+        // and sat on a black frame instead of playing the next one. 123-126
+        // are the arrow keys, 49 is Space.
+        let isTransport = (123...126).contains(Int(event.keyCode)) || event.keyCode == 49
+            || chars == "j" || chars == "k" || chars == "l"
+        if !isTransport, onKey?(isReturn || chars == "s", isReturn) ?? false {
             return nil
         }
         let magnitude: Double = flags.contains(.shift) ? 60 : 30

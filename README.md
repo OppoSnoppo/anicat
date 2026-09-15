@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="assets/branding/logo.png" alt="Anicat" width="140">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/logo-dark.png">
+    <img src="assets/branding/logo.png" alt="Anicat" width="140">
+  </picture>
   <h1>Anicat</h1>
   <p><strong>Watch, read, and track anime, manga, light novels and film — a native desktop app powered by AniList.</strong></p>
 

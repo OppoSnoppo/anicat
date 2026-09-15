@@ -89,8 +89,8 @@ public struct KeyboardShortcutsOverlay: View {
             // place the chord existed.
             items: [
                 ShortcutItem(id: "playpause", label: "Play / pause", keys: ["Space"]),
-                ShortcutItem(id: "seekback", label: "Seek backward 10s", keys: ["←"]),
-                ShortcutItem(id: "seekfwd", label: "Seek forward 10s", keys: ["→"]),
+                ShortcutItem(id: "seekback", label: "Seek backward 5s", keys: ["←"]),
+                ShortcutItem(id: "seekfwd", label: "Seek forward 5s", keys: ["→"]),
                 ShortcutItem(id: "seekback30", label: "Seek backward 30s (60s with Shift)", keys: ["J"]),
                 ShortcutItem(id: "seekfwd30", label: "Seek forward 30s (60s with Shift)", keys: ["L"]),
                 ShortcutItem(id: "volume", label: "Volume up / down", keys: ["↑", "↓"]),

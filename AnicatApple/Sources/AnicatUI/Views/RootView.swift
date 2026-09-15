@@ -39,6 +39,20 @@ public struct RootView: View {
     // window was already fullscreen (user did it manually before pressing
     // play), leave it that way when the player closes.
     @State private var enteredFullscreenForPlayback = false
+
+    /// The one-per-session fullscreen enter, after the first frame. Env
+    /// switch for a driven test copy: fullscreen would take the screen from
+    /// whoever is at the keyboard.
+    private func enterFullscreenForPlaybackIfWanted() {
+        guard model.activeStreamURL != nil, !enteredFullscreenForPlayback,
+              let window = AppWindow.main, !window.styleMask.contains(.fullScreen),
+              ProcessInfo.processInfo.environment["ANICAT_NO_AUTO_FULLSCREEN"] == nil else { return }
+        enteredFullscreenForPlayback = true
+        FullScreenGuard.set(true, on: window)
+    }
+    #else
+    /// No window fullscreen on iOS; the player's callback has nothing to do.
+    private func enterFullscreenForPlaybackIfWanted() {}
     #endif
 
     public init(model: AppModel) {
@@ -327,14 +341,31 @@ public struct RootView: View {
             // previous version) unmounted `MpvSurface` entirely on
             // minimize, and its `dismantleNSView` path stops playback — so
             // "Minimize" was indistinguishable from closing the player.
-            if let streamURL = model.activeStreamURL {
+            // Mounted at the press, not at the stream URL, when the play
+            // came from a card (`openingPlayerSourceKey`): the resolve takes
+            // one to three seconds, and with the mount waiting on the URL
+            // nothing on screen moved for that long and then the black, the
+            // fly-in and the first frame all landed inside a few hundred
+            // milliseconds -- "a jumpscare", the owner's word. Now the card
+            // lifts on the press and waits in place with the status line
+            // under it; the URL arrives into the already-mounted surface.
+            // A play with no card (Downloads, retry) keeps mounting on the
+            // URL, so that path is unchanged.
+            if model.activeStreamURL != nil
+                || (model.resolveStartedAt != nil && model.openingPlayerSourceKey != nil) {
                 PlayerView(
                     controller: model.playerController,
-                    streamURL: streamURL,
+                    streamURL: model.activeStreamURL,
                     onClose: {
                         #if os(macOS)
                         NSCursor.setHiddenUntilMouseMoves(false)
                         #endif
+                        // Closing during the wait is cancelling the resolve;
+                        // there is no stream to stop yet.
+                        guard model.activeStreamURL != nil else {
+                            model.cancelResolve()
+                            return
+                        }
                         withAnimation(.smooth) {
                             model.stopPlayback()
                         }
@@ -358,7 +389,18 @@ public struct RootView: View {
                     morphSource: model.openingPlayerSourceKey.map {
                         EpisodeMorphSource(key: $0, namespace: playerNamespace)
                     },
-                    morphThumbnailURL: model.openingPlayerThumbnailURL
+                    morphThumbnailURL: model.openingPlayerThumbnailURL,
+                    // After the first frame, and from a runloop turn of its
+                    // own, never inside a view update: toggled from the
+                    // player's `onAppear` the enter ran in the same
+                    // transaction that mounted the player and hid the
+                    // traffic lights, and AppKit left an unnamed
+                    // screen-sized window behind after the exit (seen live
+                    // in the AX window list). The 0.38s delay this replaced
+                    // had kept the toggle clear of that by accident.
+                    onFirstFrame: {
+                        DispatchQueue.main.async { enterFullscreenForPlaybackIfWanted() }
+                    }
                 )
                 // The player measures the window through its own
                 // GeometryReader. In a window the safe area is the strip
@@ -538,7 +580,11 @@ public struct RootView: View {
             if model.resolveStartedAt != nil {
                 VStack(alignment: .trailing, spacing: 10) {
                     Spacer()
-                    if let startedAt = model.resolveStartedAt {
+                    // Not while the player itself is up for the wait: the status
+            // line sits under the card there and this would be the same
+            // words twice.
+            if let startedAt = model.resolveStartedAt,
+               model.activeStreamURL != nil || model.openingPlayerSourceKey == nil {
                         ResolvingStreamCard(
                             startedAt: startedAt,
                             status: model.playerController.resolveStatus,
@@ -659,26 +705,24 @@ public struct RootView: View {
                 // start that timer and the cursor sat on the picture for the
                 // whole episode. Any real movement brings it straight back.
                 NSCursor.setHiddenUntilMouseMoves(true)
-                // Env switch for a driven test copy: fullscreen would take
-                // the screen from whoever is at the keyboard.
-                if !wasPlaying, !window.styleMask.contains(.fullScreen),
-                   ProcessInfo.processInfo.environment["ANICAT_NO_AUTO_FULLSCREEN"] == nil {
-                    enteredFullscreenForPlayback = true
-                    // After the player's own entrance, not on top of it: the
-                    // fade-and-scale in and the window's fullscreen zoom
-                    // running together read as two animations fighting.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) {
-                        guard model.activeStreamURL != nil, let window = AppWindow.main else { return }
-                        FullScreenGuard.set(true, on: window)
-                    }
-                }
+                // Fullscreen is entered from `PlayerView.onFirstFrame`, not
+                // from here: fired 0.38s after this edge it ran under the
+                // card opening into the picture, and fired at the mount it
+                // ran inside the mount's own transaction (see the call).
             } else {
                 AppWindow.setToolbarVisible(false)
                 AppWindow.setTrafficLightsHidden(false)
                 NSCursor.setHiddenUntilMouseMoves(false)
-                if wasPlaying, enteredFullscreenForPlayback, window.styleMask.contains(.fullScreen) {
+                // The flag resets on every close, not only the fullscreen
+                // one: left true after a close that found the window
+                // already windowed, the next session's enter was refused
+                // and the play stayed in a window (seen in the log: a
+                // resolve with no "[fullscreen]" line after it).
+                let exitFullscreen = wasPlaying && enteredFullscreenForPlayback
+                    && window.styleMask.contains(.fullScreen)
+                enteredFullscreenForPlayback = false
+                if exitFullscreen {
                     FullScreenGuard.set(false, on: window)
-                    enteredFullscreenForPlayback = false
                     // Opening and closing streams in quick succession once
                     // left the window in a fullscreen the player had asked
                     // for with no player in it; the exit had been queued
@@ -1637,6 +1681,7 @@ private struct HomeSectionView: View {
             .frame(maxWidth: SumiContentWidth.forAvailable(viewport.size.width), alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .top)
         }
+        .scrollLagProbe("home")
         .background(SumiTheme.background)
         .sheet(isPresented: $showHomeCustomize) {
             HomeCustomizeSheet(model: model, isPresented: $showHomeCustomize)
@@ -1809,6 +1854,14 @@ private func pointerIsOverHorizontalScroller() -> Bool {
     guard let window = NSApp.keyWindow ?? NSApp.mainWindow,
           let contentView = window.contentView else { return false }
     let point = contentView.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    // The registered strips first. The hit test below walks NSViews, and a
+    // SwiftUI ScrollView's content does not always sit under one in the
+    // responder chain: scrolling the detail tabs out to "More" and back
+    // closed the page again with the hit test in place.
+    let topLeft = CGPoint(x: point.x, y: contentView.isFlipped ? point.y : contentView.bounds.height - point.y)
+    if BackSwipeExemptRegions.frames.values.contains(where: { $0.contains(topLeft) }) {
+        return true
+    }
     guard let hit = contentView.hitTest(point) else { return false }
     return sequence(first: hit, next: { $0.superview }).contains { view in
         guard let scroll = view as? NSScrollView, let document = scroll.documentView else {
@@ -1899,12 +1952,19 @@ private struct GlobalKeyboardShortcutsModifier: ViewModifier {
             // Fresh gesture start on began phase or after an idle pause
             if event.phase == .began || now.timeIntervalSince(tracker.lastSwipeEventAt) > 0.15 {
                 tracker.reset()
+                let hitStart = CFAbsoluteTimeGetCurrent()
                 tracker.startedOverHorizontalScroller = pointerIsOverHorizontalScroller()
+                PlayerLog.write(String(format: "[scroll] back-swipe hit test %.2fms", (CFAbsoluteTimeGetCurrent() - hitStart) * 1000))
             }
+            // Stamped before the strip check, not after it: with the stamp
+            // below the early return, a gesture over a strip never
+            // refreshed it, every tick read as a fresh gesture, and the hit
+            // test above ran on all of them -- eight in 20ms in the log, at
+            // 0.5ms each, for the length of the flick.
+            tracker.lastSwipeEventAt = now
             // A sideways scroll belongs to whatever is under the pointer, not
             // to navigation.
             if tracker.startedOverHorizontalScroller { return }
-            tracker.lastSwipeEventAt = now
 
             // Normalize deltaX so physical swipe right (back) is positive, swipe left (forward) is negative.
             let rawDeltaX = event.isDirectionInvertedFromDevice ? event.scrollingDeltaX : -event.scrollingDeltaX
@@ -2053,14 +2113,14 @@ private struct GlobalKeyboardShortcutsModifier: ViewModifier {
                 model.playerController.togglePlayPause()
                 return nil
             }
-            // Left arrow: seek -10s
+            // Left arrow: seek -5s
             if event.keyCode == 123 {
-                model.playerController.seekRelative(by: -10)
+                model.playerController.seekRelative(by: -5)
                 return nil
             }
-            // Right arrow: seek +10s
+            // Right arrow: seek +5s
             if event.keyCode == 124 {
-                model.playerController.seekRelative(by: 10)
+                model.playerController.seekRelative(by: 5)
                 return nil
             }
             // Up arrow: volume +5%

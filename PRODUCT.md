@@ -38,8 +38,8 @@ Name "Anicat" and existing app icon are established; no other visual identity (p
 ## Evidence on Hand
 
 - `README.md`, `ARCHITECTURE.md`, `CLAUDE.md` — architecture and command reference.
-- `assets/branding/logo.png`, `assets/branding/dashboard.png` — existing logo and a real dashboard screenshot.
-- `assets/branding/icon.icns` — the app icon.
+- `assets/branding/paw.svg` — the mark. `logo.png`/`logo-dark.png`, `icon.icns` (the app icon) and the iPhone icon set are rendered from it by `scripts/build-brand-assets.sh`.
+- `assets/branding/dashboard.png` — a real dashboard screenshot.
 - No user testimonials, case studies, or usage metrics on hand — do not fabricate any.
 
 ## Product Principles
