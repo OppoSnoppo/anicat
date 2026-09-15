@@ -394,6 +394,12 @@ public final class AppModel {
     /// The status-line poller `resolveAndPlay` runs beside its resolve; see
     /// `cancelResolve` for why Cancel stops it directly.
     var activeResolvePoller: Task<Void, Never>?
+    /// Watches a stream that has just been handed to mpv; see
+    /// `AppModel+OpeningWatchdog.swift`.
+    var openingWatchdogTask: Task<Void, Never>?
+    /// Releases the watchdog already gave up on for the episode playing,
+    /// so it never bounces between two dead ones. Cleared with the episode.
+    var stalledReleaseNames: Set<String> = []
     /// From a cinema page opening until its deferred extras fetch has
     /// answered either way. `cinemaExtras == nil` alone cannot tell "not
     /// yet" from "failed", and a series page waiting on it drew a spinner in
