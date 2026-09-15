@@ -57,7 +57,14 @@ struct TVPlayerView: View {
                 } label: {
                     Color.clear
                 }
-                .buttonStyle(.plain)
+                // Not `.plain`: tvOS lights a focused plain button with the
+                // white lift highlight, and this one is the size of the
+                // screen. The picture went white the moment the chrome
+                // timed out and focus landed here. A style of our own draws
+                // nothing on focus, and `focusEffectDisabled` covers the
+                // halo the system would still add around it.
+                .buttonStyle(TVInvisibleButtonStyle())
+                .focusEffectDisabled()
                 .focused($focus, equals: .surface)
                 .onMoveCommand { direction in
                     switch direction {
@@ -80,6 +87,7 @@ struct TVPlayerView: View {
                     .transition(.opacity)
             }
         }
+        .accessibilityIdentifier("tv.player")
         .onPlayPauseCommand {
             controller.togglePlayPause()
             controller.showControlsBriefly()
@@ -460,6 +468,14 @@ private struct TimelineBar: View {
             .scaleEffect(y: 1, anchor: .center)
             .animation(.easeOut(duration: 0.15), value: isFocused)
         }
+    }
+}
+
+/// A button that draws nothing, focused or not. See the focus holder in
+/// `TVPlayerView`.
+private struct TVInvisibleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
     }
 }
 #endif

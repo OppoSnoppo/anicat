@@ -119,6 +119,10 @@ targets:
         SWIFT_VERSION: "6.0"
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    # Spelled out because a `scheme` on any target (the TV one, below,
+    # for its UI tests) switches off the scheme xcodegen would otherwise
+    # generate for every target, and CI builds this one by name.
+    scheme: {}
 
   # The Apple TV app. Same entry file and the same two package products as
   # the phone; `AnicatApp.swift` mounts `TVRootView` under `#if os(tvOS)`.
@@ -183,4 +187,27 @@ targets:
         SWIFT_VERSION: "6.0"
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+    scheme:
+      testTargets:
+        - AnicatTVUITests
+
+  # Remote-driven smoke tests for the TV app; see TVSmokeTests.swift. Not
+  # in CI: they need the network (AniList, TMDB, a stream) and a booted
+  # tvOS simulator. Run with
+  #   xcodebuild test -scheme AnicatTV -only-testing AnicatTVUITests \
+  #     -destination 'platform=tvOS Simulator,name=Apple TV'
+  AnicatTVUITests:
+    type: bundle.ui-testing
+    platform: tvOS
+    sources:
+      - path: Tests/AnicatTVUITests
+    dependencies:
+      - target: AnicatTV
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anicat.tv.uitests
+        TARGETED_DEVICE_FAMILY: "3"
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: AnicatTV
 

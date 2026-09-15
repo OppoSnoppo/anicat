@@ -473,6 +473,9 @@ struct TVPosterCard: View {
                 .clipped()
             }
             .buttonStyle(.card)
+            // The button's label is a picture; VoiceOver (and the UI
+            // tests) need the title on it.
+            .accessibilityLabel(item.title)
 
             Text(item.title)
                 .font(.system(size: 22))
@@ -673,7 +676,6 @@ private struct LibraryTab: View {
 private struct SearchTab: View {
     @Bindable var model: AppModel
     @Binding var showDetail: Bool
-    @State private var query = ""
 
     var body: some View {
         NavigationStack {
@@ -699,23 +701,26 @@ private struct SearchTab: View {
             .background(SumiTheme.background)
             // tvOS draws the search keyboard across the top of the tab and
             // the results underneath it; there is no field to place.
-            .searchable(text: $query, prompt: model.appMode == .cinema ? "Search films and series" : "Search anime")
-            // As you type, debounced. The TV keyboard has no submit key --
-            // `onSubmit(of: .search)` never fires on tvOS, so a search that
-            // waited for it never ran. The pause keeps AniList's per-minute
-            // budget off the prefixes: a letter typed every 300ms on the
-            // grid sends one request, not one per letter. `task(id:)`
-            // cancels the pending one on every change.
-            .task(id: query) {
-                try? await Task.sleep(for: .milliseconds(450))
-                guard !Task.isCancelled else { return }
-                runSearch()
+            // Bound to the model's own query, not a local copy: the cinema
+            // search drops its results unless `model.searchQuery` still
+            // matches the text it was asked for, so a private `@State`
+            // here made every film search come back empty.
+            .searchable(text: $model.searchQuery, prompt: model.appMode == .cinema ? "Search films and series" : "Search anime")
+            // A request on every change. The TV keyboard has no submit key
+            // (`onSubmit(of: .search)` never fires on tvOS), and the model
+            // cancels the request in flight when a newer one starts, so the
+            // grid's letter-by-letter typing costs nothing but bandwidth.
+            .onChange(of: model.searchQuery) { _, query in
+                runSearch(query)
+            }
+            .onChange(of: model.appMode) { _, _ in
+                runSearch(model.searchQuery)
             }
             .modifier(DetailPush(model: model, isPresented: $showDetail))
         }
     }
 
-    private func runSearch() {
+    private func runSearch(_ query: String) {
         Task {
             if model.appMode == .cinema {
                 await model.searchCinema(query)
