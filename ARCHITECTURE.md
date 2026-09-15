@@ -66,8 +66,7 @@ absent from its SDK whatever `if #available` says.
   without the loading scrim.
 - **Player** (`Player/`): mpv draws into a `CAMetalLayer` we hand it as
   `wid`, through `gpu-next` over Vulkan on MoltenVK (MPVKit's `moltenvk`
-  context). No render context or render thread of ours; the OpenGL render
-  API path remains as an escape hatch behind `anicat_render_backend`.
+  context). No render context or render thread of ours.
   `PlayerController` is the observable state; `PlayerView` is the chrome,
   fitted to the video's letterboxed rect as reported by the render view
   itself. Intro/outro skip (AniSkip by MyAnimeList id), auto-next and the 85%

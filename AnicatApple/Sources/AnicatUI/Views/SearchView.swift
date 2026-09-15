@@ -593,7 +593,17 @@ public struct SearchView: View {
             withAnimation(.snappy) { proxy.scrollTo(keyboardItems[index].id, anchor: .center) }
         }
         .onChange(of: results.count) { _, _ in keyboardIndex = nil }
-        .onAppear { searchFocused = true }
+        // Asked again a beat after appearing. Written only from `onAppear`
+        // the focus did not take when the page was opened from the sidebar:
+        // the page is inserted inside the navigation's transaction, before
+        // the field is in the window, and the write was dropped. Typing then
+        // went to the global letter shortcuts, so "hyouka" jumped back to
+        // Up Next on the "h".
+        .task {
+            searchFocused = true
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            if !searchFocused { searchFocused = true }
+        }
         .onChange(of: page.size.width, initial: true) { _, width in pageWidth = width }
         }
         }

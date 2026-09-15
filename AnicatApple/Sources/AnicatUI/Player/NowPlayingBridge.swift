@@ -40,7 +40,7 @@ public final class NowPlayingBridge: @unchecked Sendable {
     /// Same step as the player's own skip buttons and the left/right arrow
     /// shortcuts, so a headset's double-tap and the on-screen button land
     /// on the same frame.
-    public static let skipInterval: TimeInterval = 10
+    public static let skipInterval: TimeInterval = 5
 
     /// Artwork is requested at up to this many pixels on its longest side.
     /// 600 is the key the detail page's poster (`MediaDetailView`) already
@@ -157,10 +157,12 @@ public final class NowPlayingBridge: @unchecked Sendable {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
+    /// Both platforms. This was macOS-only, so the iOS lock screen drew the
+    /// episode with a pause glyph while it played and a play glyph while it
+    /// was paused: the tile's state came from the audio session's guess,
+    /// not from mpv.
     private func setPlaybackState(_ state: MPNowPlayingPlaybackState) {
-        #if os(macOS)
         MPNowPlayingInfoCenter.default().playbackState = state
-        #endif
     }
 
     // MARK: Artwork

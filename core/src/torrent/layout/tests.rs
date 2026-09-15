@@ -461,3 +461,24 @@ fn a_split_cour_still_remaps_inside_its_own_season() {
         "[Group] 86 Eighty Six - 12 [1080p].mkv"
     );
 }
+
+/// AniList 1535 — "DEATH NOTE" (TV, 37). A BDRip pack named TV-style,
+/// `Death Note - 01x36 - 1.28.mkv`: the " - 01" in front of every episode
+/// number read as episode 1 for all 37 files, and episode 36 (the largest)
+/// played for episode 1.
+#[test]
+fn a_season_by_episode_pack_is_read_by_the_number_after_the_x() {
+    let files: Vec<(String, u64)> = [
+        (1, "Rebirth"), (2, "Confrontation"), (3, "Dealings"), (25, "Silence"), (36, "1.28"), (37, "New World"),
+    ]
+    .iter()
+    .map(|(n, t)| (format!("Death Note/Death Note - 01x{:02} - {}.mkv", n, t), 500_000_000 + *n as u64))
+    .collect();
+    let files: Vec<(&str, u64)> = files.iter().map(|(p, l)| (p.as_str(), *l)).collect();
+    let entry = || (vec!["DEATH NOTE".to_string()], EntryHint::default(), Some(37));
+    let release = "Death Note [BDRip 1080p][HEVC x265 10bit][Dual-Audio]";
+    assert_eq!(choose(&files, release, entry(), 1).unwrap(), "Death Note/Death Note - 01x01 - Rebirth.mkv");
+    assert_eq!(choose(&files, release, entry(), 36).unwrap(), "Death Note/Death Note - 01x36 - 1.28.mkv");
+    assert_eq!(choose(&files, release, entry(), 4), Err(SelectError::NotFound));
+    assert_eq!(search::filename_episode("Show 1920x1080 - 05.mkv"), Some(5));
+}

@@ -330,7 +330,18 @@ struct PersonPortrait: View {
                 RoundedRectangle(cornerRadius: SumiTheme.radiusLg)
                     .stroke(SumiTheme.border, lineWidth: 1)
             )
-            .frame(width: 200)
+            // 200pt beside a text column is a Mac layout; on a 402pt phone
+            // it left the name column 150pt wide and the stat badges broke
+            // into one letter per line.
+            .frame(width: Self.width)
+    }
+
+    static var width: CGFloat {
+        #if os(iOS)
+        return 120
+        #else
+        return 200
+        #endif
     }
 }
 

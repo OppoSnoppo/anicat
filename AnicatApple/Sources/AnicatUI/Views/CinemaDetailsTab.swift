@@ -155,6 +155,7 @@ struct CinemaDetailsTabSection: View {
                 }
                 .padding(.vertical, 2)
             }
+            .backSwipeExempt()
         }
     }
 

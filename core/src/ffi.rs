@@ -16,12 +16,12 @@ use std::sync::Arc;
 
 use crate::catalog::{anilist, cache::AniListCache, Catalogs};
 use crate::db::{Catalog, ExportedRelease, Registry};
+use crate::discord::{DiscordClient, DiscordPresence, DiscordPresenceDetail, DiscordPresenceSource};
 use crate::media::MediaKey;
 use crate::reader::mangadex::MangaDexClient;
 use crate::reader::mangakatana::MangaKatanaClient;
 use crate::reader::lnori::LnoriClient;
 use crate::reader::syosetu::SyosetuClient;
-use crate::discord::DiscordClient;
 use crate::torrent::{layout, ResolveTarget, TorrentManager};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -233,6 +233,20 @@ impl From<crate::torrent::ResolvePhase> for ResolvePhase {
             crate::torrent::ResolvePhase::Buffering => ResolvePhase::Buffering,
         }
     }
+}
+
+/// An opening or ending found in the audio, in seconds of the episode.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SkipSpan {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// One on-disk span of the playing file, as fractions of its length.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BufferedRange {
+    pub start: f64,
+    pub end: f64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -920,6 +934,8 @@ pub struct FfiWatchStats {
     pub top_titles: Vec<FfiTitleCount>,
     /// 0-23 local. 0 when there is no history at all.
     pub busiest_hour: i32,
+    /// Episodes started per local hour, 24 entries, index 0 = midnight.
+    pub by_hour: Vec<i32>,
     pub first_watch_at: Option<String>,
 }
 
@@ -1053,7 +1069,7 @@ impl AnicatEngine {
         // librqbit and the DHT are chatty at info and say nothing a viewer
         // of this log can act on, so they sit at warn unless asked for.
         let _ = env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info,librqbit=warn,librqbit_dht=warn,librqbit_core=warn,hyper=warn,reqwest=warn,tracing::span=off"),
+            env_logger::Env::default().default_filter_or("info,librqbit=warn,librqbit_dht=warn,librqbit_core=warn,hyper=warn,reqwest=warn,tracing::span=off,discord_rich_presence=error"),
         )
         .format_timestamp_millis()
         .try_init();
@@ -1210,6 +1226,35 @@ impl AnicatEngine {
     }
 
     /// Find a torrent for an episode and hand back what the player opens.
+    /// Marks the release playing this episode as the wrong episode or the
+    /// wrong show. It is never offered for this title again (unless picked
+    /// by hand), every episode it was remembered for is forgotten, and the
+    /// next resolve searches afresh. Answers the rejected release's name, or
+    /// `None` when nothing is known to have played this episode.
+    pub async fn reject_playing_release(
+        &self,
+        catalog: FfiCatalog,
+        catalog_id: i64,
+        episode: i64,
+    ) -> FfiResult<Option<String>> {
+        let media = MediaKey::new(catalog.into(), catalog_id);
+        let name = match self.torrents.winner_name(media, episode).await {
+            Some(name) => Some(name),
+            None => self
+                .registry
+                .remembered_release(media.catalog, media.id, episode)
+                .map_err(|msg| AnicatError::Internal { msg })?
+                .map(|r| r.name),
+        };
+        let Some(name) = name else { return Ok(None) };
+        self.registry
+            .reject_release(media.catalog, media.id, &name)
+            .map_err(|msg| AnicatError::Internal { msg })?;
+        self.torrents.forget_media(media).await;
+        log::warn!("[verify] viewer rejected '{}' for {} ep {}", name, media, episode);
+        Ok(Some(name))
+    }
+
     pub async fn resolve_stream(&self, req: StreamRequest) -> FfiResult<StreamHandle> {
         // A film or an episode of a western series is searched on year or on
         // SxxEyy, neither of which the anime path has any notion of. Falling
@@ -1243,6 +1288,14 @@ impl AnicatEngine {
             .flatten()
             .filter(|r| r.prefer_dub == req.prefer_dub);
 
+        let rejected = self
+            .registry
+            .rejected_releases(media.catalog, media.id)
+            .unwrap_or_default();
+        // Started now and read by each candidate as it is tried, so the AniDB
+        // lookups overlap the search instead of adding to it.
+        let franchise = self.franchise_aids(req.catalog_id);
+
         let url = self
             .torrents
             .resolve(
@@ -1267,6 +1320,8 @@ impl AnicatEngine {
                     sibling_titles: &info.siblings,
                     resume_fraction: req.resume_fraction,
                     remembered,
+                    rejected: &rejected,
+                    franchise: Some(franchise),
                 },
                 port,
             )
@@ -1341,6 +1396,77 @@ impl AnicatEngine {
             .flatten()
             .filter(|r| r.prefer_dub == prefer_dub)
             .map(|r| r.name)
+    }
+
+    /// Which parts of the file being played are already on disk, as
+    /// fractions of the file (0.0-1.0), sorted and merged. What the seek
+    /// bar's buffered segments are drawn from; mpv's own `demuxer-cache-
+    /// state` only knows its 128 MB window, so a torrent that has fetched
+    /// the whole episode ahead of the playhead showed a bar that was still
+    /// mostly empty. Cheap enough to poll once a second: one mutex, one
+    /// metadata read, one bitfield walk.
+    pub fn playing_file_buffered(&self) -> Vec<BufferedRange> {
+        self.torrents
+            .playing_file_ranges()
+            .into_iter()
+            .map(|(start, end)| BufferedRange { start, end })
+            .collect()
+    }
+
+    /// The playing torrent's swarm and progress, for the player's stream
+    /// details panel. Polled while that panel is open; same cost class as
+    /// `playing_file_buffered`.
+    pub fn playing_torrent_stats(&self) -> Option<crate::torrent::PlayingTorrentStats> {
+        self.torrents.playing_torrent_stats()
+    }
+
+    /// Whether an opening (`"op"`) or ending (`"ed"`) fingerprint is stored
+    /// for this title, i.e. whether one episode's audio is enough.
+    pub fn has_skip_reference(&self, catalog: FfiCatalog, catalog_id: i64, kind: String) -> bool {
+        matches!(self.registry.skip_reference(catalog.into(), catalog_id, &kind), Ok(Some(_)))
+    }
+
+    /// Compares two episodes' audio (raw mono s16le at 11025 Hz, see
+    /// `skip::read_pcm`) and stores what they share as this title's `kind`
+    /// reference. Answers the span in the first file, offset by `offset`
+    /// seconds (where in the episode its PCM begins). CPU-bound for a
+    /// fraction of a second: call it off the main thread.
+    pub fn detect_skip_segment(
+        &self,
+        catalog: FfiCatalog,
+        catalog_id: i64,
+        kind: String,
+        pcm_path: String,
+        offset: f64,
+        other_pcm_path: String,
+    ) -> Option<SkipSpan> {
+        let a = crate::skip::fingerprint(&crate::skip::read_pcm(std::path::Path::new(&pcm_path)).ok()?);
+        let b = crate::skip::fingerprint(&crate::skip::read_pcm(std::path::Path::new(&other_pcm_path)).ok()?);
+        let (span, reference) = crate::skip::detect_shared(&a, offset, &b)?;
+        if let Err(e) = self.registry.set_skip_reference(
+            catalog.into(),
+            catalog_id,
+            &kind,
+            &crate::skip::prints_to_bytes(&reference),
+        ) {
+            log::warn!("skip: storing the {kind} reference for {catalog_id} failed: {e}");
+        }
+        Some(SkipSpan { start: span.start, end: span.end })
+    }
+
+    /// Searches one episode's audio for the stored `kind` reference.
+    pub fn find_skip_segment(
+        &self,
+        catalog: FfiCatalog,
+        catalog_id: i64,
+        kind: String,
+        pcm_path: String,
+        offset: f64,
+    ) -> Option<SkipSpan> {
+        let bytes = self.registry.skip_reference(catalog.into(), catalog_id, &kind).ok()??;
+        let reference = crate::skip::prints_from_bytes(&bytes);
+        let target = crate::skip::fingerprint(&crate::skip::read_pcm(std::path::Path::new(&pcm_path)).ok()?);
+        crate::skip::find_reference(&reference, &target, offset).map(|s| SkipSpan { start: s.start, end: s.end })
     }
 
     /// Bytes the torrent stream cache is holding on disk.
@@ -2255,6 +2381,8 @@ impl AnicatEngine {
                     sibling_titles: if cinema.is_some() { &[] } else { &info.siblings },
                     resume_fraction: None,
                     remembered: None,
+                    rejected: &[],
+                    franchise: None,
                 },
             )
             .await;
@@ -2345,6 +2473,8 @@ impl AnicatEngine {
                     sibling_titles: if cinema.is_some() { &[] } else { &info.siblings },
                     resume_fraction: None,
                     remembered: None,
+                    rejected: &[],
+                    franchise: None,
                 },
                 port,
             )
@@ -2543,7 +2673,17 @@ impl AnicatEngine {
             .history_for(Catalog::Anilist, catalog_id)
             .unwrap_or_default();
 
-        let episode_count = m.episodes.unwrap_or(0);
+        // AniList leaves `episodes` null for a show still airing with no
+        // announced end. One Piece (id 21, next episode 1179) came back as
+        // zero episodes and its page said "No episodes found"; what has aired
+        // is everything before the next airing episode.
+        let episode_count = m.episodes.unwrap_or_else(|| {
+            m.next_airing_episode
+                .as_ref()
+                .and_then(|n| n.episode)
+                .map(|next| (next - 1).max(0))
+                .unwrap_or(0)
+        });
         let streaming = m.streaming_episodes.clone().unwrap_or_default();
         // AniList's own progress on this title's list entry. The local
         // watch-history registry is per-device — a fresh install (or a
@@ -3261,36 +3401,34 @@ impl AnicatEngine {
             .map_err(|msg| AnicatError::Network { msg })
     }
 
-    /// Connects to the local Discord client over IPC, if one is running.
-    /// Silently a no-op when Discord isn't installed or open — this is a
-    /// presence nicety, never something playback should fail over.
+    /// Turns Discord presence on. Returns at once: connecting, and
+    /// reconnecting when Discord starts later, happen on the presence
+    /// worker, and a Discord that is not running is never an error. A no-op
+    /// on iOS, where no Discord socket exists.
     pub fn discord_connect(&self) {
         self.discord.connect();
     }
 
+    /// Clears the activity and closes the socket, on the worker.
     pub fn discord_disconnect(&self) {
         self.discord.disconnect();
     }
 
-    /// `episode_title` empty means "show Episode N instead"; `duration <= 0`
-    /// means unknown, which drops the "time remaining" countdown entirely
-    /// rather than showing a nonsensical one.
-    #[allow(clippy::too_many_arguments)]
-    pub fn discord_set_presence(
-        &self,
-        title: String,
-        episode: i64,
-        episode_title: String,
-        total_episodes: i64,
-        pos: i64,
-        duration: i64,
-        paused: bool,
-    ) {
-        self.discord.set_presence(&title, episode, &episode_title, total_episodes, pos, duration, paused);
+    /// Rewrites whatever is showing at the new level straight away.
+    pub fn discord_set_detail(&self, detail: DiscordPresenceDetail) {
+        self.discord.set_detail(detail);
     }
 
-    pub fn discord_clear_presence(&self) {
-        self.discord.clear_presence();
+    /// Cheap enough to call on every player tick: it only replaces the wanted
+    /// state, and the worker writes when the profile would actually change.
+    pub fn discord_update(&self, presence: DiscordPresence) {
+        self.discord.update(presence);
+    }
+
+    /// Clears one source only, so closing the reader over a playing
+    /// mini-player leaves the episode's presence in place.
+    pub fn discord_clear_presence(&self, source: DiscordPresenceSource) {
+        self.discord.clear(source);
     }
 
     pub fn record_progress(
@@ -3693,6 +3831,7 @@ impl AnicatEngine {
                 })
                 .collect(),
             busiest_hour: stats.busiest_hour,
+            by_hour: stats.by_hour,
             first_watch_at: stats.first_watch_at,
         })
     }
@@ -3897,6 +4036,75 @@ fn push_child_comments(
 }
 
 impl AnicatEngine {
+    /// This entry's AniDB franchise: its own AniDB id and those of every
+    /// entry reachable through prequel/sequel/parent/side-story links. Built
+    /// in the background; see `verify::FranchiseAids`.
+    fn franchise_aids(&self, anilist_id: i64) -> crate::torrent::verify::FranchiseAids {
+        use crate::torrent::verify;
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let http = self.http.clone();
+        let catalogs = self.catalogs.clone();
+        let registry = self.registry.clone();
+        tokio::spawn(async move {
+            // Bounded: a long franchise is a dozen seasons and films, and the
+            // AniList detail fetches are cached, so this is cheap after once.
+            const MAX_ENTRIES: usize = 24;
+            let mut ids = vec![anilist_id];
+            let mut next = 0;
+            while next < ids.len() && ids.len() < MAX_ENTRIES {
+                let id = ids[next];
+                next += 1;
+                let Ok(detail) = catalogs.media_detail(id, false).await else { continue };
+                let Some(media) = detail.media else { continue };
+                for edge in media.relations.and_then(|r| r.edges).unwrap_or_default() {
+                    let Some(relation) = edge.relation_type.as_deref() else { continue };
+                    let Some(node) = edge.node else { continue };
+                    if !verify::is_chain_relation(relation)
+                        || matches!(node.format.as_deref(), Some("MANGA") | Some("NOVEL") | Some("ONE_SHOT"))
+                        || ids.contains(&node.id)
+                    {
+                        continue;
+                    }
+                    ids.push(node.id);
+                }
+            }
+            let lookups = ids.iter().map(|&id| {
+                let http = http.clone();
+                let registry = registry.clone();
+                async move {
+                    if let Ok(Some(stored)) = registry.anidb_id(id) {
+                        return (id, stored);
+                    }
+                    match verify::anidb_for_anilist(&http, id).await {
+                        Ok(found) => {
+                            let _ = registry.set_anidb_id(id, found);
+                            (id, found)
+                        }
+                        Err(e) => {
+                            log::warn!("[verify] AniDB mapping for AniList {} unavailable: {}", id, e);
+                            (id, None)
+                        }
+                    }
+                }
+            });
+            let found = futures_util::future::join_all(lookups).await;
+            // Without this entry's own id there is nothing to judge against:
+            // a set of only its sequels would refuse its own releases.
+            let own = found.iter().find(|(id, _)| *id == anilist_id).and_then(|(_, aid)| *aid);
+            let set = own.map(|_| {
+                std::sync::Arc::new(found.iter().filter_map(|(_, aid)| *aid).collect::<std::collections::HashSet<i64>>())
+            });
+            log::info!(
+                "[verify] AniList {} franchise: {} entries, AniDB ids {:?}",
+                anilist_id,
+                ids.len(),
+                set.as_ref().map(|s| { let mut v: Vec<_> = s.iter().copied().collect(); v.sort(); v })
+            );
+            let _ = tx.send(Some(set));
+        });
+        rx
+    }
+
     /// Records a download once it lands, whatever the UI is doing.
     ///
     /// Polls the same status the episode row polls, at the same interval, and
@@ -3987,6 +4195,8 @@ impl AnicatEngine {
                     sibling_titles: &[],
                     resume_fraction: req.resume_fraction,
                     remembered,
+                    rejected: &[],
+                    franchise: None,
                 },
                 port,
             )

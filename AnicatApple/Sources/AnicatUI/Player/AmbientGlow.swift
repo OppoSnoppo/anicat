@@ -13,17 +13,12 @@ import ImageIO
 public struct AmbientFrame: @unchecked Sendable, Equatable, Identifiable {
     public let id: Int
     public let image: CGImage
-    /// The outer fifth of the frame on each side. Each letterbox bar is lit
-    /// by the band of picture it touches, the way a zoned backlight is: a
-    /// single blurred copy of the whole frame mixed the centre into every
-    /// bar and the light did not line up with the picture's edges.
-    public let top: CGImage
-    public let bottom: CGImage
-    public let left: CGImage
-    public let right: CGImage
-    /// The same four bands as colour stops for `AmbientGlowView`'s gradient
-    /// layers: `horizontalStops` along the top and bottom bars,
-    /// `verticalStops` down the pillars. Fixed counts, whatever the
+    /// The outer fifth of the frame on each side, as colour stops for
+    /// `AmbientGlowView`'s gradient layers: `horizontalStops` along the top
+    /// and bottom bars, `verticalStops` down the pillars. Each letterbox bar
+    /// is lit by the band of picture it touches, the way a zoned backlight
+    /// is: a single blurred copy of the whole frame mixed the centre into
+    /// every bar and the light did not line up with the picture's edges. Fixed counts, whatever the
     /// thumbnail's size: Core Animation only interpolates between colour
     /// arrays of equal length, and the drawable's aspect changes with the
     /// window.
@@ -44,10 +39,6 @@ public struct AmbientFrame: @unchecked Sendable, Equatable, Identifiable {
         self.image = image
         let w = CGFloat(image.width), h = CGFloat(image.height)
         let bw = max(1, (w * Self.bandFraction).rounded()), bh = max(1, (h * Self.bandFraction).rounded())
-        // Each band is collapsed to one pixel across its thin axis, so a
-        // top band is 64x1: one colour per column, like the LEDs behind a
-        // TV. A 64x7 band stretched over a 110 pt bar showed its seven
-        // source rows as horizontal stripes through the blur.
         let topCrop = image.cropping(to: CGRect(x: 0, y: 0, width: w, height: bh)) ?? image
         // The bottom band is taken from just above the subtitle zone, the
         // rows 12% to 22% up from the edge, rather than the edge itself:
@@ -58,10 +49,6 @@ public struct AmbientFrame: @unchecked Sendable, Equatable, Identifiable {
         let bottomCrop = image.cropping(to: CGRect(x: 0, y: h - subtitleZone - bh / 2, width: w, height: bh / 2)) ?? image
         let leftCrop = image.cropping(to: CGRect(x: 0, y: 0, width: bw, height: h)) ?? image
         let rightCrop = image.cropping(to: CGRect(x: w - bw, y: 0, width: bw, height: h)) ?? image
-        top = Self.collapse(topCrop, to: CGSize(width: w, height: 1)) ?? topCrop
-        bottom = Self.collapse(bottomCrop, to: CGSize(width: w, height: 1)) ?? bottomCrop
-        left = Self.collapse(leftCrop, to: CGSize(width: 1, height: h)) ?? leftCrop
-        right = Self.collapse(rightCrop, to: CGSize(width: 1, height: h)) ?? rightCrop
         topColors = Self.stops(of: topCrop, count: Self.horizontalStops, horizontal: true)
         bottomColors = Self.stops(of: bottomCrop, count: Self.horizontalStops, horizontal: true)
         leftColors = Self.stops(of: leftCrop, count: Self.verticalStops, horizontal: false)
@@ -542,6 +529,27 @@ extension AmbientGlow {
             bottom: refined(bottom, of: height, level: { rowLevel(height - 1 - $0) }) / Double(height),
             left: refined(left, of: width, level: { columnLevel($0) }) / Double(width),
             right: refined(right, of: width, level: { columnLevel(width - 1 - $0) }) / Double(width)
+        )
+    }
+
+    /// How far apart the two bars of one axis may be and still count as
+    /// bars. An encode centres its picture (Grisaia: 130 rows above, 131
+    /// below), so real bars match to a row or two.
+    static let barAsymmetry = 0.02
+
+    /// `inset` with any axis whose two bars do not match dropped. A dark
+    /// shot reads as bar only where it is dark: Sword Art Online II episode 3
+    /// at 20:06, a hat brim on black, came out as 0.20 top, 0.16 right and
+    /// nothing opposite, and the glow painted a lit band over the top fifth
+    /// and the right sixth of the picture for as long as the shot lasted.
+    public static func centredBars(_ inset: AmbientContentInset) -> AmbientContentInset {
+        let rows = abs(inset.top - inset.bottom) <= barAsymmetry
+        let columns = abs(inset.left - inset.right) <= barAsymmetry
+        return AmbientContentInset(
+            top: rows ? inset.top : 0,
+            bottom: rows ? inset.bottom : 0,
+            left: columns ? inset.left : 0,
+            right: columns ? inset.right : 0
         )
     }
 

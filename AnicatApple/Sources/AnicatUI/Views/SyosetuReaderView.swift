@@ -51,12 +51,23 @@ public struct SyosetuReaderView: View {
         // and take the whole window -- prose in a 560pt box with the app
         // showing around it was the thing to get rid of.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(SumiTheme.background)
+        // The ground fills the screen on both platforms; only the Mac lets
+        // the content under the title strip too. On the phone an ignored
+        // safe area put the header under the Dynamic Island.
+        .background(SumiTheme.background.ignoresSafeArea())
+        #if os(macOS)
         .ignoresSafeArea()
+        #endif
     }
 
     private var urlEntry: some View {
         SumiPage {
+            // The reading body has its own Close; the entry screen had none
+            // and relied on Escape, which a phone does not have.
+            HStack {
+                SumiOutlineButton("Close", systemImage: "xmark", action: model.closeSyosetuReader)
+                Spacer()
+            }
             SumiPageHeader(title: "Read a Light Novel", subtitle: "PASTE A SYOSETU LINK")
             VStack(alignment: .leading, spacing: 12) {
                 Text("Paste a novel or chapter link from ncode.syosetu.com — the whole table of contents loads from it.")
@@ -66,6 +77,17 @@ public struct SyosetuReaderView: View {
                     TextField("https://ncode.syosetu.com/n2267be/", text: $urlField)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(load)
+                        // The phone keyboard capitalised the first letter,
+                        // and the engine's origin regex is case-sensitive:
+                        // "Https://" loaded the table of contents (the
+                        // fetch does not care) and then every chapter href
+                        // came back root-relative and was refused as "not
+                        // a syosetu.com URL".
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                        #endif
                     SumiOutlineButton("Open", systemImage: "book", action: load)
                         .disabled(urlField.trimmingCharacters(in: .whitespaces).isEmpty)
                 }

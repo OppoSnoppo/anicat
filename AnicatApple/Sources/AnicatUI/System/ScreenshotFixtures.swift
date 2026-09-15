@@ -147,6 +147,9 @@ enum ScreenshotFixtures {
             longestStreakDays: Int32(longest),
             topTitles: topTitles,
             busiestHour: 21,
+            // An evening viewer: a tail from 19:00 peaking at 21:00, a few
+            // lunchtime episodes, nothing overnight.
+            byHour: [0, 0, 0, 0, 0, 0, 0, 1, 2, 1, 1, 3, 4, 2, 1, 1, 2, 3, 5, 9, 14, 18, 12, 5],
             firstWatchAt: ISO8601DateFormatter().string(from: first)
         )
     }

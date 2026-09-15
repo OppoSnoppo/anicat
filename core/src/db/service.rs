@@ -852,6 +852,86 @@ impl Registry {
     }
 
     /// The release that last played for this episode, if one was recorded.
+    /// A stored opening (`"op"`) or ending (`"ed"`) fingerprint, as bytes.
+    pub fn skip_reference(&self, catalog: Catalog, catalog_id: i64, kind: &str) -> Result<Option<Vec<u8>>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT prints FROM skip_references WHERE catalog = ?1 AND catalog_id = ?2 AND kind = ?3",
+            params![catalog.as_str(), catalog_id, kind],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn set_skip_reference(&self, catalog: Catalog, catalog_id: i64, kind: &str, prints: &[u8]) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO skip_references (catalog, catalog_id, kind, prints, created_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(catalog, catalog_id, kind) DO UPDATE SET
+                prints = excluded.prints, created_at = excluded.created_at",
+            params![catalog.as_str(), catalog_id, kind, prints],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Rejects a release for a title and forgets every episode it was
+    /// remembered for, so neither the search nor the fast path offers it
+    /// again.
+    pub fn reject_release(&self, catalog: Catalog, catalog_id: i64, name: &str) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO rejected_releases (catalog, catalog_id, name) VALUES (?1, ?2, ?3)",
+            params![catalog.as_str(), catalog_id, name],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM resolved_releases WHERE catalog = ?1 AND catalog_id = ?2 AND name = ?3",
+            params![catalog.as_str(), catalog_id, name],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn rejected_releases(&self, catalog: Catalog, catalog_id: i64) -> Result<Vec<String>, String> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT name FROM rejected_releases WHERE catalog = ?1 AND catalog_id = ?2")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![catalog.as_str(), catalog_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// `Some(mapping)` when a fresh enough answer is stored (the mapping itself
+    /// may be `None`: AniDB has no such entry), `None` when it has to be
+    /// fetched.
+    pub fn anidb_id(&self, anilist_id: i64) -> Result<Option<Option<i64>>, String> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT anidb_id FROM anidb_ids WHERE anilist_id = ?1
+               AND (anidb_id IS NOT NULL OR fetched_at > datetime('now', '-7 days'))",
+            params![anilist_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn set_anidb_id(&self, anilist_id: i64, anidb_id: Option<i64>) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO anidb_ids (anilist_id, anidb_id, fetched_at) VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(anilist_id) DO UPDATE SET anidb_id = excluded.anidb_id, fetched_at = excluded.fetched_at",
+            params![anilist_id, anidb_id],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
     pub fn remembered_release(
         &self,
         catalog: Catalog,
@@ -1326,7 +1406,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(v, 9);
+        assert_eq!(v, 11);
     }
 
     /// A database stamped 5, 6 or 7 by a build that numbered the `completed`
@@ -1434,6 +1514,36 @@ mod tests {
         }
         let rows = db.progress_rows().unwrap();
         assert_eq!(rows[0].watched_at.to_rfc3339(), "2026-01-30T23:30:00+00:00");
+    }
+
+    #[test]
+    fn a_rejected_release_is_listed_and_no_longer_remembered() {
+        let db = Registry::open_in_memory().unwrap();
+        let release = RememberedRelease {
+            name: "Sword.Art.Online.Alternative.Gun.Gale.Online.S01 (GGO)".into(),
+            magnet: None,
+            torrent_url: None,
+            assume_batch: true,
+            prefer_dub: false,
+        };
+        db.remember_release(Catalog::Anilist, 20594, 2, &release).unwrap();
+        db.remember_release(Catalog::Anilist, 20594, 3, &release).unwrap();
+        db.reject_release(Catalog::Anilist, 20594, &release.name).unwrap();
+        db.reject_release(Catalog::Anilist, 20594, &release.name).unwrap();
+        assert_eq!(db.rejected_releases(Catalog::Anilist, 20594).unwrap(), vec![release.name.clone()]);
+        assert_eq!(db.remembered_release(Catalog::Anilist, 20594, 2).unwrap(), None);
+        assert_eq!(db.remembered_release(Catalog::Anilist, 20594, 3).unwrap(), None);
+        assert!(db.rejected_releases(Catalog::Anilist, 1535).unwrap().is_empty());
+    }
+
+    #[test]
+    fn anidb_ids_round_trip_including_no_mapping() {
+        let db = Registry::open_in_memory().unwrap();
+        assert_eq!(db.anidb_id(20594).unwrap(), None);
+        db.set_anidb_id(20594, Some(10376)).unwrap();
+        db.set_anidb_id(1, None).unwrap();
+        assert_eq!(db.anidb_id(20594).unwrap(), Some(Some(10376)));
+        assert_eq!(db.anidb_id(1).unwrap(), Some(None));
     }
 
     #[test]

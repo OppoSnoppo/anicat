@@ -86,9 +86,13 @@ struct CharacterDetailView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                HStack(spacing: 6) {
-                    ForEach(metaBadges, id: \.self) { badge in
-                        StatusBadge(.neutral(badge))
+                // Scrolls rather than wraps: a badge is one fact, and a
+                // fact split over two lines reads as two.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(metaBadges, id: \.self) { badge in
+                            StatusBadge(.neutral(badge))
+                        }
                     }
                 }
                 .padding(.top, 2)

@@ -40,6 +40,12 @@ if [ -f "$ICON" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$PLIST" 2>/dev/null \
         || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$PLIST"
 fi
+# The macOS 26 icon with its dark variant; see package-anicat-macos-app.sh.
+if [ -f ../assets/branding/Assets.car ]; then
+    cp ../assets/branding/Assets.car dist/Anicat.app/Contents/Resources/Assets.car
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIconName AppIcon" "$PLIST" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$PLIST"
+fi
 # Same activity types the packaged plist declares; without them Spotlight
 # hits and Handoff never reach the app.
 /usr/libexec/PlistBuddy -c "Delete :NSUserActivityTypes" "$PLIST" 2>/dev/null || true

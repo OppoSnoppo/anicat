@@ -25,6 +25,7 @@ INSTALL="${2:-}"
 APP="$SRC/dist/Anicat.app"
 EXE_NAME="Anicat"
 ICON="$ROOT/assets/branding/icon.icns"
+ICON_CAR="$ROOT/assets/branding/Assets.car"
 
 echo "=== Building ($CONFIG) ==="
 (cd "$SRC" && swift build -c "$CONFIG")
@@ -63,6 +64,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>${VERSION}</string>
     <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>AnicatCommit</key>
     <string>${COMMIT}</string>
@@ -118,6 +121,12 @@ if [ -f "$ICON" ]; then
     cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 else
     echo "package-anicat-macos-app: warning: no icon at $ICON" >&2
+fi
+# macOS 26 reads CFBundleIconName out of Assets.car and ignores the icns.
+# Without it the system derives its own dark icon from the light one: a
+# black plate under the light-mode indigo paw, which all but disappears.
+if [ -f "$ICON_CAR" ]; then
+    cp "$ICON_CAR" "$APP/Contents/Resources/Assets.car"
 fi
 
 if [ -d "$SRC/Sources/AnicatUI/Resources/Fonts" ]; then

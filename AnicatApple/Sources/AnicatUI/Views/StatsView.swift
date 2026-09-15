@@ -214,7 +214,11 @@ public struct StatsView: View {
     }
 
     private func summaryRow(_ stats: FfiWatchStats) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        // Five across is a Mac row; at 402pt each tile got 66pt and the
+        // "Longest streak" label wrapped onto three lines under a number it
+        // no longer sat next to. A grid of at least 150pt tiles is two
+        // across on a phone and still one row on the Mac.
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], alignment: .leading, spacing: 12) {
             statTile("Hours", String(format: "%.1f", Double(stats.totalWatchSeconds) / 3600))
             statTile("Episodes", "\(stats.episodesWatched)")
             statTile("Titles", "\(stats.titlesStarted)")
@@ -338,9 +342,6 @@ public struct StatsView: View {
 
     private func habitCard(_ stats: FfiWatchStats) -> some View {
         card(title: "Habits") {
-            // Stated rather than charted: the registry answers with the single
-            // busiest hour, not a 24-bucket histogram, and a bar chart of one
-            // known value and 23 blanks would be a picture of nothing.
             HStack(spacing: 6) {
                 Text("You start episodes most often around")
                     .font(.system(size: 13))
@@ -348,6 +349,10 @@ public struct StatsView: View {
                 Text(String(format: "%02d:00", stats.busiestHour))
                     .sumiTabularMono(size: 13, weight: .bold)
                     .foregroundColor(SumiTheme.indigo)
+            }
+
+            if stats.byHour.count == 24, stats.byHour.contains(where: { $0 > 0 }) {
+                hourChart(stats.byHour, busiest: Int(stats.busiestHour))
             }
 
             if let firstWatch = stats.firstWatchAt {
@@ -358,6 +363,35 @@ public struct StatsView: View {
                     .foregroundColor(SumiTheme.muted)
             }
         }
+    }
+
+    /// Episodes started per hour of the day, the busiest hour in full
+    /// accent. Drawn like the History page's 30-day bars, 48pt tall: the
+    /// card is a sentence with a picture under it, not a page of its own.
+    private func hourChart(_ byHour: [Int32], busiest: Int) -> some View {
+        let peak = max(byHour.max() ?? 1, 1)
+        return VStack(spacing: 4) {
+            HStack(alignment: .bottom, spacing: 3) {
+                ForEach(0..<24, id: \.self) { hour in
+                    let count = byHour[hour]
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(hour == busiest ? SumiTheme.indigo : SumiTheme.indigo.opacity(0.45))
+                        .frame(height: max(CGFloat(count) / CGFloat(peak) * 48, count > 0 ? 3 : 2))
+                        .opacity(count > 0 ? 1 : 0.25)
+                        .frame(maxWidth: .infinity)
+                        .help("\(count) episode\(count == 1 ? "" : "s") started at \(String(format: "%02d:00", hour))")
+                }
+            }
+            HStack(spacing: 3) {
+                ForEach(0..<24, id: \.self) { hour in
+                    Text(hour % 6 == 0 ? String(format: "%02d", hour) : " ")
+                        .sumiTabularMono(size: 9)
+                        .foregroundColor(hour == busiest ? SumiTheme.indigo : SumiTheme.muted)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .padding(.top, 4)
     }
 
     private func topTitlesCard(_ stats: FfiWatchStats) -> some View {

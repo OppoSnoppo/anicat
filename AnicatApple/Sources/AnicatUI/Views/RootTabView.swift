@@ -3,14 +3,13 @@ import SwiftUI
 
 /// The iPhone root, in place of `RootView`'s 200pt sidebar rail.
 ///
-/// Not a narrower `RootView`: the rail is a list of ten sections, and a phone
-/// reaches for three of them. Anime only, and no Downloads tab — a phone fills
-/// up long before a Mac does, so streaming is the whole story here and the
-/// engine's cache is the only thing that touches storage.
-///
-/// The rail's other sections (Manga, Light Novels, Schedule, Stats, History)
-/// are not hidden behind a "more" tab; they are absent. Adding one means
-/// designing it for touch first.
+/// Not a narrower `RootView`: the rail is a list of ten sections and a tab
+/// bar holds five. Up Next, Library and Search are the three a phone reaches
+/// for; Read carries manga and light novels under one segment, the way the
+/// header already carries Anime and Films & TV; More holds the rest
+/// (Schedule, History, Downloads, Stats, Settings) in the rail's own order.
+/// The first cut shipped three tabs with the rest "absent, not hidden", and
+/// the absence read as the app being a viewer.
 public struct RootTabView: View {
     @Bindable var model: AppModel
 
@@ -19,7 +18,7 @@ public struct RootTabView: View {
     }
 
     enum Tab: Hashable {
-        case upNext, library, search
+        case upNext, library, read, search, more
     }
 
     @State private var tab: Tab = .upNext
@@ -44,9 +43,24 @@ public struct RootTabView: View {
                     .tabItem { Label("Library", systemImage: "rectangle.stack") }
                     .tag(Tab.library)
 
+                PhoneReadTab(model: model, showDetail: scoped(to: .read))
+                    .tabItem { Label("Read", systemImage: "book") }
+                    .tag(Tab.read)
+
                 SearchTab(model: model, showDetail: scoped(to: .search))
                     .tabItem { Label("Search", systemImage: "magnifyingglass") }
                     .tag(Tab.search)
+
+                PhoneMoreTab(model: model, showDetail: scoped(to: .more))
+                    .tabItem { Label("More", systemImage: "ellipsis.circle") }
+                    .tag(Tab.more)
+            }
+            // Room for the mini-player bar above the tab bar, so the last
+            // row of a list is not under it.
+            .safeAreaInset(edge: .bottom) {
+                if model.activeStreamURL != nil, model.isPlayerMinimized {
+                    Color.clear.frame(height: PhonePlayerView.miniBarHeight + 8)
+                }
             }
 
             // One call site, outside the TabView, and deliberately not inside
@@ -58,6 +72,13 @@ public struct RootTabView: View {
                 PhonePlayerView(
                     controller: model.playerController,
                     streamURL: streamURL,
+                    isMinimized: model.isPlayerMinimized,
+                    onMinimize: {
+                        withAnimation(.sumi(.page)) { model.isPlayerMinimized = true }
+                    },
+                    onRestore: {
+                        withAnimation(.sumi(.page)) { model.isPlayerMinimized = false }
+                    },
                     onClose: {
                         withAnimation(.smooth) { model.stopPlayback() }
                     }
@@ -81,6 +102,68 @@ public struct RootTabView: View {
             // Behind an `if` for the same reason as the desktop's: this layer
             // is above the player's zIndex and should exist only while it has
             // something on it.
+            // The readers and the person pages sit over the tab view at the
+            // same layers the Mac gives them (`RootView`): both readers are
+            // pure SwiftUI with their AppKit bits behind `#if os(macOS)`,
+            // so the phone mounts the same views and adds no twin. One call
+            // site each, outside the tabs, for the reason the player is.
+            if let session = model.activeReadingSession {
+                MangaReaderView(
+                    title: session.title,
+                    chapterTitle: session.chapterTitle,
+                    pageURLs: session.pageURLs,
+                    initialPage: session.startPage,
+                    onPageChanged: { page in
+                        model.recordReadingPage(chapterId: session.chapterId, page: page, pageCount: session.pageURLs.count)
+                        ContinuityManager.shared.advertiseReading(
+                            mangaId: session.chapterId, anilistId: session.anilistId,
+                            title: session.title, chapter: session.chapterTitle, pageIndex: page)
+                    },
+                    onNextChapter: { Task { await model.nextChapter() } },
+                    onPrevChapter: { Task { await model.prevChapter() } },
+                    onClose: { withAnimation(.smooth) { model.closeReader() } }
+                )
+                .transition(.opacity)
+                .zIndex(35)
+            }
+
+            if model.novelReaderOpen {
+                SyosetuReaderView(model: model)
+                    .transition(.opacity)
+                    .zIndex(31)
+            }
+
+            if let page = model.personPageStack.last {
+                PersonPageView(model: model)
+                    .id(page.id)
+                    .background(SumiTheme.background.ignoresSafeArea())
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .zIndex(34)
+            }
+
+            if let personId = model.openCinemaPersonId {
+                CinemaPersonView(
+                    model: model,
+                    personId: personId,
+                    fallbackName: model.openCinemaPersonName,
+                    onDismiss: { model.openCinemaPersonId = nil }
+                )
+                .background(SumiTheme.background.ignoresSafeArea())
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+                .zIndex(34)
+            }
+
+            // First launch, above everything, as on the Mac. The phone
+            // mounted nothing here for its first three days: `initialize`
+            // set `onboardingOpen` and no view read it, so the flag stayed
+            // true, the shelves showed under it, and Settings was the only
+            // route to "Connect AniList".
+            if model.onboardingOpen {
+                OnboardingView(model: model)
+                    .zIndex(80)
+                    .transition(.opacity)
+            }
+
             if model.resolveStartedAt != nil {
                 VStack(spacing: 10) {
                     if let startedAt = model.resolveStartedAt {
@@ -101,6 +184,14 @@ public struct RootTabView: View {
             }
         }
         .animation(.snappy, value: model.resolveStartedAt)
+        .animation(.smooth, value: model.onboardingOpen)
+        // The lock is applied from `syncPlaybackSession`, which does not
+        // run on a minimise; this is the one other edge it has to follow.
+        .onChange(of: model.isPlayerMinimized) { _, minimized in
+            OrientationLock.apply(playerOpen: model.activeStreamURL != nil && !minimized)
+        }
+        .animation(.sumi(.page), value: model.personPageStack.count)
+        .animation(.sumi(.page), value: model.openCinemaPersonId)
         .tint(SumiTheme.indigo)
         // A deep link (`anicat://title/<id>`) and a notification tap both go
         // straight to `openDetail` on the model, with no row tapped to have
@@ -134,9 +225,16 @@ public struct RootTabView: View {
         //
         // To the detail page, not into playback, matching macOS: a system
         // callback carries no user gesture, and forcing a resolve from one
-        // races `resolveAndPlay`'s own resume logic. The reading activity is
-        // deliberately not handled here -- the phone has no reader UI to
-        // hand off into.
+        // races `resolveAndPlay`'s own resume logic.
+        .onContinueUserActivity(AppModel.spotlightActivityType) { activity in
+            model.handleSpotlightActivity(activity)
+        }
+        .onContinueUserActivity(ContinuityManager.readingActivityType) { activity in
+            guard case .reading(let chapterId, let anilistId, _, _, let page) =
+                    ContinuityManager.shared.parseIncomingActivity(activity),
+                  let anilistId else { return }
+            Task { await model.openReadingHandoff(anilistId: anilistId, chapterId: chapterId, page: page) }
+        }
         .onContinueUserActivity(ContinuityManager.playbackActivityType) { activity in
             guard case .playback(let catalogId, let catalog, let title, _, _) =
                     ContinuityManager.shared.parseIncomingActivity(activity) else { return }
@@ -177,7 +275,7 @@ public struct RootTabView: View {
 /// them, and switching it from inside Library should leave you in Library.
 /// Hidden entirely when the engine reports no TMDB access — a dead segment
 /// that silently refuses to switch is worse than no segment.
-private struct ModeToggle: View {
+struct ModeToggle: View {
     @Bindable var model: AppModel
 
     var body: some View {
@@ -203,7 +301,7 @@ private struct ModeToggle: View {
 /// what the design sheet draws. Hiding the bar on the tab roots and drawing
 /// the title here starts the content about 60pt higher. Pushed pages keep
 /// the real navigation bar, so Back is untouched.
-private struct TabHeader<Trailing: View>: View {
+struct TabHeader<Trailing: View>: View {
     let title: String
     var model: AppModel?
     @ViewBuilder var trailing: Trailing
@@ -237,7 +335,7 @@ private struct TabHeader<Trailing: View>: View {
 /// Clearing the model is driven off the flag going false — doing it in the
 /// page's `onDisappear` also fired on a tab switch, which emptied the page
 /// still pushed on the tab being left.
-private struct DetailPush: ViewModifier {
+struct DetailPush: ViewModifier {
     @Bindable var model: AppModel
     @Binding var isPresented: Bool
 
@@ -450,7 +548,7 @@ private struct UpNextTab: View {
 /// A horizontal row of posters. The grid is for a page whose whole job is
 /// one list; a shelf is for a page carrying several, where each row has to
 /// stay one screen-height tall so the next row is visible under it.
-private struct PosterShelf: View {
+struct PosterShelf: View {
     let title: String
     let items: [MediaCard.Item]
     let onOpen: (MediaCard.Item) -> Void
@@ -495,7 +593,7 @@ private struct PosterShelf: View {
     }
 }
 
-private struct ContinueWatchingRow: View {
+struct ContinueWatchingRow: View {
     @Bindable var model: AppModel
     let onOpen: (Int64, String, URL?, Bool) -> Void
 
@@ -533,7 +631,7 @@ private struct ContinueWatchingRow: View {
     }
 }
 
-private struct ContinueWatchingCard: View {
+struct ContinueWatchingCard: View {
     let entry: UpNextQueueView.QueueEntry
 
     var body: some View {
@@ -573,7 +671,7 @@ private struct ContinueWatchingCard: View {
     }
 }
 
-private struct NewEpisodeRow: View {
+struct NewEpisodeRow: View {
     let entry: UpNextQueueView.QueueEntry
     let action: () -> Void
 
@@ -623,6 +721,24 @@ private struct LibraryTab: View {
     /// resets to CURRENT every launch, so someone who lives in Completed had
     /// to re-pick it every time they opened the app.
     @AppStorage("anicat_library_status") private var storedStatus = "CURRENT"
+    /// AniList's own order is "recently updated", which is what the site
+    /// shows and what the Mac keeps. The others are client-side over the
+    /// fetched page, so they cost nothing and never touch the engine.
+    @AppStorage("anicat_library_sort") private var sortRaw = LibrarySort.updated.rawValue
+    @AppStorage("anicat_library_layout") private var layoutRaw = "grid"
+    @State private var formatFilter = ""
+
+    enum LibrarySort: String, CaseIterable {
+        case updated, title, score, progress
+        var label: String {
+            switch self {
+            case .updated: return "Recently updated"
+            case .title: return "Title"
+            case .score: return "Score"
+            case .progress: return "Progress"
+            }
+        }
+    }
 
     /// The six AniList list statuses, in the order the site itself lists
     /// them. Paired with their labels here rather than reusing
@@ -641,6 +757,51 @@ private struct LibraryTab: View {
     /// on the first frame, before the fetch that syncs the model has run.
     private var currentLabel: String {
         Self.statuses.first { $0.raw == storedStatus }?.label ?? "Watching"
+    }
+
+    private var sort: LibrarySort { LibrarySort(rawValue: sortRaw) ?? .updated }
+    private var isGrid: Bool { layoutRaw != "list" }
+
+    /// The formats present in the fetched list, so the chips never offer a
+    /// filter that empties the page. `format` is optional on the card: an
+    /// old HomeCache snapshot decodes without it and those rows fall under
+    /// no chip rather than under a "Unknown" one.
+    private var availableFormats: [String] {
+        var seen: [String] = []
+        for item in model.libraryItems {
+            if let format = item.format, !format.isEmpty, !seen.contains(format) { seen.append(format) }
+        }
+        return seen
+    }
+
+    private var shownItems: [MediaCard.Item] {
+        var items = model.libraryItems
+        if !formatFilter.isEmpty { items = items.filter { $0.format == formatFilter } }
+        switch sort {
+        case .updated: break
+        case .title: items.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .score: items.sort { ($0.score ?? -1) > ($1.score ?? -1) }
+        case .progress:
+            items.sort { Self.progressFraction($0) > Self.progressFraction($1) }
+        }
+        return items
+    }
+
+    static func progressFraction(_ item: MediaCard.Item) -> Double {
+        guard let progress = item.progress, let total = item.totalEpisodesOrChapters, total > 0 else {
+            return Double(item.progress ?? 0) / 10_000
+        }
+        return Double(progress) / Double(total)
+    }
+
+    static func formatLabel(_ raw: String) -> String {
+        switch raw {
+        case "TV": return "TV"
+        case "TV_SHORT": return "TV Short"
+        case "MOVIE": return "Movie"
+        case "ONE_SHOT": return "One Shot"
+        default: return raw.capitalized
+        }
     }
 
     var body: some View {
@@ -677,11 +838,30 @@ private struct LibraryTab: View {
                             detail: "Titles you move to this list on AniList show up here."
                         )
                     } else {
-                        Text("\(model.libraryItems.count) TITLES")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(SumiTheme.muted)
-                            .padding(.horizontal, 16)
-                        PosterGrid(items: model.libraryItems, onOpen: open)
+                        if availableFormats.count > 1 {
+                            formatChips
+                        }
+                        HStack {
+                            Text("\(shownItems.count) TITLES")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(SumiTheme.muted)
+                            Spacer()
+                            sortMenu
+                            Button {
+                                layoutRaw = isGrid ? "list" : "grid"
+                            } label: {
+                                Image(systemName: isGrid ? "list.bullet" : "square.grid.2x2")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(SumiTheme.muted)
+                            }
+                            .accessibilityLabel(isGrid ? "Show as list" : "Show as grid")
+                        }
+                        .padding(.horizontal, 16)
+                        if isGrid {
+                            PosterGrid(items: shownItems, onOpen: open)
+                        } else {
+                            PosterList(items: shownItems, onOpen: open)
+                        }
                     }
                 }
                 .padding(.vertical, 8)
@@ -730,6 +910,54 @@ private struct LibraryTab: View {
         }
     }
 
+    @ViewBuilder
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $sortRaw) {
+                ForEach(LibrarySort.allCases, id: \.rawValue) { option in
+                    Text(option.label).tag(option.rawValue)
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(sort.label)
+                    .font(.system(size: 12))
+            }
+            .foregroundStyle(SumiTheme.muted)
+        }
+    }
+
+    /// One row of chips, "All" first, scrolling sideways when the list has
+    /// more formats than fit. A filter is one tap on and one tap off.
+    @ViewBuilder
+    private var formatChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                chip("All", selected: formatFilter.isEmpty) { formatFilter = "" }
+                ForEach(availableFormats, id: \.self) { format in
+                    chip(Self.formatLabel(format), selected: formatFilter == format) {
+                        formatFilter = formatFilter == format ? "" : format
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private func chip(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 13, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? SumiTheme.background : SumiTheme.foreground)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 6)
+                .background(selected ? SumiTheme.indigo : SumiTheme.card, in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
     /// TMDB ids are not AniList ids and the detail fetch is a different call,
     /// so cinema rows cannot go through `openDetail`.
     private func openCinema(_ item: MediaCard.Item) {
@@ -755,6 +983,64 @@ private struct LibraryTab: View {
     }
 }
 
+/// The list layout: a thumbnail, the title and the progress on one row.
+/// For the viewer who keeps a 200-title Completed list and wants to scan
+/// names, which a two-line poster caption cannot do.
+struct PosterList: View {
+    let items: [MediaCard.Item]
+    let onOpen: (MediaCard.Item) -> Void
+
+    var body: some View {
+        LazyVStack(spacing: 0) {
+            ForEach(items) { item in
+                Button { onOpen(item) } label: {
+                    HStack(spacing: 12) {
+                        CachedAsyncImage(url: item.coverImageURL, maxPixelSize: 200) { image in
+                            image.resizable().aspectRatio(contentMode: .fill)
+                        } placeholder: {
+                            SumiTheme.card
+                        }
+                        .frame(width: 44, height: 62)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(item.title)
+                                .font(.system(size: 15))
+                                .foregroundStyle(SumiTheme.foreground)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                            // Progress replaces the grid's episode count
+                            // rather than joining it: "11 / 12 6.4 · 12 EPS"
+                            // said twelve twice with no separator.
+                            HStack(spacing: 6) {
+                                if let progress = item.progress, progress > 0 {
+                                    Text("\(progress)\(item.totalEpisodesOrChapters.map { " / \($0)" } ?? "")")
+                                    if let score = item.score, score > 0 {
+                                        Text("\u{00B7} " + String(format: "%.1f", Double(score) / 10))
+                                    }
+                                } else if let meta = PosterGrid.meta(for: item) {
+                                    Text(meta)
+                                }
+                            }
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(SumiTheme.muted)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(SumiTheme.muted)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Divider().overlay(SumiTheme.border).padding(.leading, 72)
+            }
+        }
+    }
+}
+
 // MARK: - Search
 
 private struct SearchTab: View {
@@ -765,12 +1051,40 @@ private struct SearchTab: View {
     /// phone is not catalog data and has no business in the registry that
     /// syncs a watch history.
     @AppStorage("anicat_recent_searches") private var recentsRaw = ""
+    @State private var filters = PhoneSearchFilters()
+    @State private var showFilters = false
+
+    /// The Mac searches on a 350ms debounce; the phone searched on submit
+    /// only, on the theory that per-keystroke searches burn AniList's
+    /// per-minute budget. The debounce is what makes that theory moot: a
+    /// pause in typing is one request, and the Mac has run this way for
+    /// months without hitting the limit.
+    private static let debounce: Duration = .milliseconds(350)
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 24) {
-                    TabHeader(title: "Search", model: model) { EmptyView() }
+                    TabHeader(title: "Search", model: model) {
+                        // In the header, not the toolbar: the tab roots hide
+                        // the navigation bar (see `TabHeader`).
+                        if model.appMode == .anime {
+                            Button {
+                                showFilters = true
+                            } label: {
+                                Image(systemName: filters.isActive
+                                      ? "line.3.horizontal.decrease.circle.fill"
+                                      : "line.3.horizontal.decrease.circle")
+                                    .font(.system(size: 24))
+                                    .foregroundStyle(filters.isActive ? SumiTheme.indigo : SumiTheme.muted)
+                            }
+                            .accessibilityLabel("Filters")
+                        }
+                    }
+
+                    if model.appMode == .anime {
+                        activeFilterChips
+                    }
 
                     if model.appMode == .cinema {
                         if model.cinemaSearchResults.isEmpty {
@@ -797,32 +1111,73 @@ private struct SearchTab: View {
             // `.searchable` gives the system field, Cancel button and the
             // scroll-to-reveal behaviour for free. The desktop's command
             // palette has no iOS counterpart and is not reproduced.
-            .searchable(text: $query, prompt: "Search anime")
-            // Search on submit rather than on every keystroke: AniList is
-            // rate-limited per minute and a per-character search burns the
-            // budget on prefixes nobody asked for.
+            .searchable(text: $query, prompt: filters.placeholder)
             .onSubmit(of: .search) {
                 remember(query)
-                Task {
-                    if model.appMode == .cinema {
-                        await model.searchCinema(query)
-                    } else {
-                        await model.search(query: query)
-                    }
-                }
+                Task { await runSearch() }
             }
-            .onChange(of: query) { _, new in
-                if new.isEmpty {
-                    Task {
-                        if model.appMode == .cinema {
-                            await model.searchCinema("")
-                        } else {
-                            await model.search(query: "")
-                        }
-                    }
-                }
+            // `.task(id:)` is the debounce: a keystroke cancels the sleep
+            // of the previous one, so only the pause after typing searches.
+            .task(id: query) {
+                try? await Task.sleep(for: Self.debounce)
+                guard !Task.isCancelled else { return }
+                await runSearch()
+            }
+            .onChange(of: filters) { _, _ in
+                Task { await runSearch() }
+            }
+            .sheet(isPresented: $showFilters) {
+                PhoneSearchFilterSheet(filters: $filters)
+                    .presentationDetents([.medium, .large])
             }
             .modifier(DetailPush(model: model, isPresented: $showDetail))
+        }
+    }
+
+    /// One place decides what a search means, for the debounce, the submit
+    /// and a filter change alike. An empty query with no filter clears the
+    /// results rather than searching for nothing.
+    private func runSearch() async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if model.appMode == .cinema {
+            await model.searchCinema(trimmed)
+            return
+        }
+        if trimmed.isEmpty, !filters.isActive {
+            await model.search(query: "")
+            return
+        }
+        await model.search(query: trimmed, mediaType: filters.mediaType, filters: filters.engineFilters)
+    }
+
+    /// The filters in force, as chips above the results. A tap on one
+    /// clears just that filter; the sheet is for setting them.
+    @ViewBuilder
+    private var activeFilterChips: some View {
+        let active = filters.activeChips
+        if !active.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(active, id: \.label) { chip in
+                        Button {
+                            filters.clear(chip.key)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(chip.label)
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .bold))
+                            }
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(SumiTheme.background)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 6)
+                            .background(SumiTheme.indigo, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
         }
     }
 
@@ -870,8 +1225,9 @@ private struct SearchTab: View {
             .padding(.horizontal, 16)
 
             FlowChips(items: recents) { term in
+                // Setting the query is enough: the `.task(id:)` debounce
+                // runs the search with the filters in force.
                 query = term
-                Task { await model.search(query: term) }
             }
             .padding(.horizontal, 16)
         }
@@ -997,7 +1353,7 @@ private struct ResolvingCard: View {
 
 // MARK: - Shared pieces
 
-private struct PosterSection: View {
+struct PosterSection: View {
     let title: String
     let items: [MediaCard.Item]
     let onOpen: (MediaCard.Item) -> Void
@@ -1012,7 +1368,7 @@ private struct PosterSection: View {
     }
 }
 
-private struct PosterGrid: View {
+struct PosterGrid: View {
     let items: [MediaCard.Item]
     let onOpen: (MediaCard.Item) -> Void
 
@@ -1081,7 +1437,7 @@ private struct PosterGrid: View {
     }
 }
 
-private struct SectionHeader: View {
+struct SectionHeader: View {
     let text: String
     init(_ text: String) { self.text = text }
 
@@ -1093,7 +1449,7 @@ private struct SectionHeader: View {
     }
 }
 
-private struct EmptyHint: View {
+struct EmptyHint: View {
     let title: String
     let detail: String
 

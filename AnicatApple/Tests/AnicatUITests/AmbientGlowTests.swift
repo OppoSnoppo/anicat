@@ -206,6 +206,14 @@ struct AmbientGlowTests {
         #expect(inset.top == Double(barRows) / Double(height))
     }
 
+    @Test("Dark picture on one side of an axis is not a bar")
+    func unmatchedBarsAreDropped() {
+        let shot = AmbientGlow.centredBars(AmbientContentInset(top: 0.20, bottom: 0, left: 0, right: 0.16))
+        #expect(shot.isZero)
+        let letterbox = AmbientGlow.centredBars(AmbientContentInset(top: 0.120, bottom: 0.121, left: 0, right: 0.3))
+        #expect(letterbox == AmbientContentInset(top: 0.120, bottom: 0.121, left: 0, right: 0))
+    }
+
     @Test("A picture that fills its frame reports no bars at all")
     func fullFrameHasNoInset() throws {
         let (bytes, stride) = frame(width: 64, height: 36) { _, _ in (120, 120, 120) }

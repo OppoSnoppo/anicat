@@ -47,7 +47,18 @@ public struct SystemIntegrationObserver: View {
                 }
                 guard phase == .background else { return }
                 RemoteClient.shared.disconnect()
-                Task { await model.purgeStreamCache() }
+                // Not while a download is in flight: the purge evicts every
+                // torrent but the one playing, and a download is neither.
+                // Seen: Home pressed at 59 MB into an episode, the engine
+                // logged "evicted ... 06 [1080p].mkv", the row went to
+                // failed. The download simply waits out the suspension.
+                let downloading = model.libraryDownloads.contains { row in
+                    if case .downloading = row.state { return true }
+                    return false
+                }
+                if !downloading {
+                    Task { await model.purgeStreamCache() }
+                }
             }
             // A Mac that appears *while* the app is in the foreground -- it
             // was launched, or woke, after this phone did.

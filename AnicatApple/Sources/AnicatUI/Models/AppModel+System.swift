@@ -20,6 +20,42 @@ extension AppModel {
         SystemNotifications.shared.activate()
     }
 
+    /// Keeps the engine's caches out of iCloud and Time Machine.
+    ///
+    /// The data dir is Application Support, which is backed up in full, and
+    /// `torrent-streams/` under it is capped at 3 GiB of video that the
+    /// swarm hands back on demand. On a phone that is every iCloud backup
+    /// carrying three gigabytes of episodes already watched, and Apple's
+    /// review guidance names re-downloadable content as exactly what the
+    /// exclusion flag is for. The registry stays: watch history and local
+    /// library are the one thing here that cannot be fetched again.
+    ///
+    /// After engine construction, which creates the cache file. The three
+    /// directories are created here rather than waited for: the engine
+    /// makes them lazily on the first stream or download, and a flag set
+    /// only on the next launch leaves that first session's files in the
+    /// backup (seen on the simulator: `offline-manga` unflagged after a
+    /// launch that never opened a chapter).
+    static func excludeCachesFromBackup(dataDir: URL) {
+        let fm = FileManager.default
+        let directories = ["torrent-streams", "offline-manga", "offline-novels"]
+            .map { dataDir.appendingPathComponent($0, isDirectory: true) }
+        for dir in directories {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let candidates = directories + [dataDir.appendingPathComponent("catalog-cache.sqlite")]
+        for url in candidates where fm.fileExists(atPath: url.path) {
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var mutable = url
+            do {
+                try mutable.setResourceValues(values)
+            } catch {
+                AppLog.write("[backup] could not exclude \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// One-shot cleanup for rows the now-deleted `SpotlightIndexer` wrote
     /// under its `"library"` domain before it was removed — deleting that
     /// file took its own `clear()` call with it, so without this those show
@@ -149,6 +185,7 @@ extension AppModel {
     public func refreshSystemIntegrations() {
         updateDockBadge()
         notifyAboutNewEpisodes()
+        refreshSpotlightIndex()
     }
 
     // MARK: - Notifications

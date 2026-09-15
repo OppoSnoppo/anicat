@@ -342,6 +342,65 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    if version < 10 {
+        conn.execute_batch(
+            "BEGIN TRANSACTION;
+
+            -- The audio fingerprint of a title's opening or ending, found by
+            -- comparing two of its episodes (`skip.rs`). Kept per AniList
+            -- entry, which is one season: a new season's opening is a new
+            -- song. With it, each later episode is searched for the stored
+            -- print instead of needing a second episode to compare against.
+            CREATE TABLE IF NOT EXISTS skip_references (
+                catalog TEXT NOT NULL,
+                catalog_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                prints BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (catalog, catalog_id, kind)
+            );
+
+            COMMIT;",
+        )
+        .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "user_version", 10)
+            .map_err(|e| e.to_string())?;
+    }
+
+    if version < 11 {
+        conn.execute_batch(
+            "BEGIN TRANSACTION;
+
+            -- A release the viewer said was the wrong episode or the wrong
+            -- show. Per title, not per episode: a pack that answered one
+            -- episode with the wrong file has shown it cannot be trusted to
+            -- place the others either, and the remembered-release fast path
+            -- would otherwise hand it straight back.
+            CREATE TABLE IF NOT EXISTS rejected_releases (
+                catalog TEXT NOT NULL,
+                catalog_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (catalog, catalog_id, name)
+            );
+
+            -- AniList id to AniDB id, from arm.haglund.dev. The mapping of an
+            -- entry does not change, and kept here a resolve checks releases
+            -- against AniDB without that host having to be up. A NULL anidb_id
+            -- is an answer too (no mapping), refetched once it is a week old.
+            CREATE TABLE IF NOT EXISTS anidb_ids (
+                anilist_id INTEGER PRIMARY KEY,
+                anidb_id INTEGER,
+                fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            COMMIT;",
+        )
+        .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "user_version", 11)
+            .map_err(|e| e.to_string())?;
+    }
+
     // Opportunistic, not required for correctness: WAL lets a read (the
     // library view repainting) proceed while a write (a progress tick) is in
     // flight, instead of the two serializing on the rollback journal.

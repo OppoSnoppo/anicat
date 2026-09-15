@@ -215,9 +215,9 @@ final class AmbientMetalSampler {
         // and the picture handed over describe the same frame.
         let sides = AmbientGlow.contentInset(bytes: bytes, width: width, height: height, stride: stride)
         if let rows = probeContentInset(), let sides {
-            contentInset = AmbientContentInset(
+            contentInset = AmbientGlow.centredBars(AmbientContentInset(
                 top: rows.top, bottom: rows.bottom, left: sides.left, right: sides.right
-            )
+            ))
         }
         // BGRA8 in memory is an ARGB word read little-endian, the same
         // layout mpv's bgr0 screenshots use.

@@ -39,6 +39,7 @@ extension AppModel {
         lastDiscordPaused = discordPaused
         hasAdvancedAniListForCurrentEpisode = false
         hasAutoAdvancedEpisode = false
+        hasLoggedAutoNextGates = false
         hasPreloadedNextEpisode = false
         playbackSessionStartedAt = Date()
         // Fifth flag, same rule: the countdown card's "cancelled" is scoped
@@ -114,6 +115,17 @@ extension AppModel {
         playerController.onNextEpisode = { [weak self] in
             Task { await self?.playAdjacentEpisode(offset: 1) }
         }
+        playerController.onFetchTorrentDetails = { [weak self] completion in
+            Task { @MainActor [weak self] in
+                guard let self, let engine = self.engine else { return }
+                // `engineIOQueue`, like every other synchronous FFI read
+                // during playback: never on the main thread.
+                self.engineIOQueue.async {
+                    let rows = Self.torrentDetailRows(engine.playingTorrentStats())
+                    Task { @MainActor in completion(rows) }
+                }
+            }
+        }
         playerController.onPreviousEpisode = { [weak self] in
             Task { await self?.playAdjacentEpisode(offset: -1) }
         }
@@ -135,6 +147,9 @@ extension AppModel {
         }
         playerController.onReloadForAudioLanguage = { [weak self] preferDub in
             self?.reloadCurrentEpisodeForAudioLanguage(preferDub: preferDub)
+        }
+        playerController.onRejectRelease = { [weak self] in
+            self?.rejectPlayingRelease()
         }
         playerController.onSelectRelease = { [weak self] name in
             // Through `activeResolveTask`, like the detail page's own play
@@ -182,6 +197,45 @@ extension AppModel {
 
     /// Replays the current episode from a different release, where the
     /// viewer had got to.
+    /// "Block & find another": the release playing is rejected for this title and
+    /// the episode is found again from its start. Names decide which file a
+    /// release is, and a name can lie; this is the way out when one did.
+    public func rejectPlayingRelease() {
+        guard let engine, let catalogId = currentPlaybackCatalogId,
+              let episode = currentPlaybackEpisode else { return }
+        let catalog = currentPlaybackCatalog
+        activeResolveTask = Task { [weak self] in
+            let rejected: String?
+            do {
+                rejected = try await engine.rejectPlayingRelease(catalog: catalog, catalogId: catalogId, episode: episode)
+            } catch {
+                self?.errorMessage = "Could not reject this release: \(error.localizedDescription)"
+                return
+            }
+            guard let self, self.currentPlaybackCatalogId == catalogId, self.currentPlaybackEpisode == episode else { return }
+            guard let rejected else {
+                self.playerController.flashHUD("No release on record for this episode", symbol: "exclamationmark.triangle")
+                return
+            }
+            print("[verify] rejected '\(rejected)' for \(catalogId) ep \(episode)")
+            self.playerController.flashHUD("Release rejected, finding another", symbol: "arrow.triangle.2.circlepath")
+            do {
+                _ = try await self.resolveAndPlay(
+                    catalog: catalog,
+                    catalogId: catalogId,
+                    episode: episode,
+                    title: self.currentPlaybackTitle,
+                    fromStart: true,
+                    forceNewFile: true
+                )
+            } catch is CancellationError {
+            } catch {
+                self.errorMessage = error.localizedDescription
+                self.playFeedback(.error)
+            }
+        }
+    }
+
     public func switchRelease(to releaseName: String) async {
         await swapPlayingFile(chosenName: releaseName, forceNewFile: false)
     }
@@ -330,7 +384,10 @@ extension AppModel {
     /// detail fetch above lands — because whichever of the two knows the
     /// MAL id first should be the one that starts the request.
     func requestAniSkipTimes(catalogId: Int64, episode: Int64) {
-        guard currentPlaybackCatalog == .anilist else { return }
+        guard currentPlaybackCatalog == .anilist else {
+            playerController.aniSkipStatus = nil
+            return
+        }
         // The open page counts only when it *is* this title; otherwise its
         // MAL id belongs to whatever the viewer navigated to since.
         let pageMalId = selectedMediaDetails?.id == catalogId ? selectedMediaDetails?.malId : nil
@@ -341,6 +398,16 @@ extension AppModel {
             // yet the final answer for a play with no page open: the detail
             // fetch may still be in flight, and it asks again when it lands.
             print("[AniSkip] no MAL id known for AniList id \(catalogId) — no skip times requested")
+            playerController.aniSkipStatus = "No MyAnimeList id for this title, nothing to ask AniSkip"
+            // A title with no MAL id is the case audio detection exists for,
+            // and it used to start only from the AniSkip answer below, so
+            // these titles got neither.
+            if playerController.duration > 1, !playerController.awaitingNewFile {
+                aniSkipAwaitingDuration = false
+                startSkipDetection()
+            } else {
+                aniSkipAwaitingDuration = true
+            }
             return
         }
         let episodeNumber = Int(episode)
@@ -353,19 +420,43 @@ extension AppModel {
         // first duration tick instead of guessing.
         guard episodeLength > 1, !playerController.awaitingNewFile else {
             aniSkipAwaitingDuration = true
+            playerController.aniSkipStatus = "Waiting for the file's duration"
             return
         }
         aniSkipAwaitingDuration = false
+        playerController.aniSkipStatus = "Asking AniSkip (MAL \(malId), episode \(episodeNumber), \(Int(episodeLength))s)"
         Task { [weak self] in
-            let times = await AniSkipClient.skipTimes(malId: malId, episode: episodeNumber, episodeLengthSeconds: episodeLength)
+            let lookup = await AniSkipClient.lookup(malId: malId, episode: episodeNumber, episodeLengthSeconds: episodeLength)
             guard let self else { return }
             // The viewer may have already moved on (next/prev, closed the
             // player) by the time this lands — a stale result applied to
             // whatever's playing now would show the wrong episode's skip
             // window.
             guard self.currentPlaybackCatalogId == catalogId, self.currentPlaybackEpisode == episode else { return }
-            self.playerController.setAniSkipTimes(times)
+            switch lookup {
+            case .found(let times):
+                self.playerController.aniSkipStatus = "Found for MAL \(malId), episode \(episodeNumber)"
+                self.playerController.setAniSkipTimes(times)
+            case .notFound:
+                self.playerController.aniSkipStatus = "No submissions for MAL \(malId), episode \(episodeNumber) (404)"
+                self.playerController.setAniSkipTimes(nil)
+                self.noteNoSkipTimes("No skip times for this episode")
+            case .failed(let reason):
+                self.playerController.aniSkipStatus = "Request failed: \(reason)"
+                self.playerController.setAniSkipTimes(nil)
+                self.noteNoSkipTimes("Skip times unavailable")
+            }
+            self.startSkipDetection()
         }
+    }
+
+    /// A short HUD line when auto-skip is on and this episode has nothing to
+    /// skip with: no chapters and no AniSkip answer. Before it, a show with
+    /// no community timestamps just played its opening, and the only way to
+    /// learn why was the log.
+    func noteNoSkipTimes(_ text: String) {
+        guard playerController.autoSkipEnabled, playerController.skipWindows.isEmpty else { return }
+        playerController.flashHUD(text, symbol: "forward.circle")
     }
 
     public func playSelectedEpisode(_ number: Int) async {
@@ -396,9 +487,12 @@ extension AppModel {
         guard let catalogId = currentPlaybackCatalogId,
               let episode = currentPlaybackEpisode else { return }
         let sorted = playbackEpisodes
-        guard let index = sorted.firstIndex(where: { $0.number == Int(episode) }) else { return }
+        guard let index = sorted.firstIndex(where: { $0.number == Int(episode) }),
+              sorted.indices.contains(index + offset) else {
+            print("[autonext] no episode at offset \(offset) from \(episode) in a list of \(sorted.count)")
+            return
+        }
         let targetIndex = index + offset
-        guard sorted.indices.contains(targetIndex) else { return }
         let target = sorted[targetIndex]
         // Belt to `updateEpisodeNavigationState`'s braces: the phone's remote
         // and the player's own Next both land here, and an episode that has
@@ -512,19 +606,122 @@ extension AppModel {
             episodeNumber: Int(episode),
             episodeTitle: playbackEpisodes.first(where: { $0.number == Int(episode) })?.title ?? ""
         )
-        let pageCover = selectedMediaDetails?.id == catalogId ? selectedMediaDetails?.coverURL : nil
         nowPlaying.setTrack(
             track,
             elapsed: playerController.currentTime,
             duration: playerController.duration,
             rate: playerController.isPlaying ? playerController.playbackRate : 0,
-            coverURL: pageCover ?? playbackCoverURL
-                ?? registryCover(catalog: currentPlaybackCatalog, id: catalogId)
+            coverURL: currentPlaybackCoverURL(catalogId: catalogId)
         )
         nowPlaying.setNavigation(
             hasNext: playerController.hasNextEpisode,
             hasPrevious: playerController.hasPreviousEpisode
         )
+        // Same late arrivals as the tile: the cover and the episode count
+        // land after the play started.
+        publishPlaybackPresence()
+    }
+
+    private func currentPlaybackCoverURL(catalogId: Int64) -> URL? {
+        let pageCover = selectedMediaDetails?.id == catalogId ? selectedMediaDetails?.coverURL : nil
+        return pageCover ?? playbackCoverURL
+            ?? registryCover(catalog: currentPlaybackCatalog, id: catalogId)
+    }
+
+    /// An episode or chapter name worth showing, or nil. Catalogs fill a
+    /// missing name with the number itself, and "E3 · Episode 3" says it twice.
+    /// Never shortened here: Discord ellipsizes a line to whatever width the
+    /// card is drawn at, and a 40-character cut of ours left "The Return of
+    /// the Time-Honored..." on a profile card with room to spare. The engine
+    /// still caps a field at Discord's 128.
+    nonisolated static func presenceEpisodeName(_ raw: String?, number: Int) -> String? {
+        guard let name = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return nil }
+        let lower = name.lowercased()
+        let placeholders = ["episode \(number)", "ep \(number)", "ep. \(number)", "chapter \(number)", "\(number)"]
+        return placeholders.contains(lower) ? nil : name
+    }
+
+    /// "2h 19m", "47m"; nil until the file reports a duration.
+    nonisolated static func presenceRuntime(seconds: Double) -> String? {
+        guard seconds >= 60 else { return nil }
+        let minutes = Int(seconds / 60)
+        return minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m"
+    }
+
+    /// The engine numbers a series' episodes absolutely; TMDB's season
+    /// breakdown turns that back into the season and the episode within it.
+    nonisolated static func presenceSeasonPlace(absoluteEpisode: Int, seasons: [CinemaSeason]) -> (season: Int, episode: Int)? {
+        var start = 1
+        for season in seasons where season.episodeCount > 0 {
+            let count = Int(season.episodeCount)
+            if absoluteEpisode < start + count {
+                return absoluteEpisode >= start ? (Int(season.number), absoluteEpisode - start + 1) : nil
+            }
+            start += count
+        }
+        return nil
+    }
+
+    /// Hands the playing episode to the engine's Discord presence worker.
+    /// Called from every tick; the engine writes only when the profile would
+    /// change (a new episode, a pause, a seek) and keeps it while presence
+    /// is switched off, so this needs no gate of its own.
+    func publishPlaybackPresence() {
+        guard let engine, activeStreamURL != nil,
+              let catalogId = currentPlaybackCatalogId,
+              let episode = currentPlaybackEpisode else { return }
+        let catalog = currentPlaybackCatalog
+        let title = currentPlaybackTitle ?? playerController.title
+        let episodeName = Self.presenceEpisodeName(
+            playbackEpisodes.first(where: { $0.number == Int(episode) })?.title,
+            number: Int(episode)
+        )
+        // The open page's facts only when the page is this title: the
+        // mini-player lets another title's page open mid-episode.
+        let page = selectedMediaDetails?.id == catalogId ? selectedMediaDetails : nil
+        let medium: String
+        let subtitle: String
+        let hover: String?
+        let link: (label: String, url: String)?
+        switch catalog {
+        case .tmdbMovie:
+            medium = "a film"
+            subtitle = [page?.year.map(String.init), Self.presenceRuntime(seconds: playerController.duration)]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+            hover = nil
+            link = ("View on TMDB", "https://www.themoviedb.org/movie/\(catalogId)")
+        case .tmdbTv:
+            medium = "a TV series"
+            let seasons = page?.mediaCatalog == .tmdbTv ? (cinemaExtras?.seasons ?? []) : []
+            let place = Self.presenceSeasonPlace(absoluteEpisode: Int(episode), seasons: seasons)
+            let code = place.map { "S\($0.season) E\($0.episode)" } ?? "E\(episode)"
+            subtitle = episodeName.map { "\(code) · \($0)" } ?? (place == nil ? "Episode \(episode)" : code)
+            hover = place.map { "\(title) · Season \($0.season), Episode \($0.episode)" }
+            link = ("View on TMDB", "https://www.themoviedb.org/tv/\(catalogId)")
+        case .anilist, .mangaDex:
+            // `.mangaDex` is never a playback catalog; the enum is shared.
+            medium = "anime"
+            subtitle = episodeName.map { "E\(episode) · \($0)" } ?? "Episode \(episode)"
+            let total = playbackEpisodes.count
+            hover = total >= Int(episode) ? "\(title) · Episode \(episode) of \(total)" : nil
+            link = catalog == .anilist ? ("View on AniList", "https://anilist.co/anime/\(catalogId)") : nil
+        }
+        engine.discordUpdate(presence: DiscordPresence(
+            source: .playback,
+            medium: medium,
+            title: title,
+            subtitle: subtitle,
+            hoverText: hover,
+            coverUrl: currentPlaybackCoverURL(catalogId: catalogId)?.absoluteString,
+            linkLabel: link?.label,
+            linkUrl: link?.url,
+            positionSecs: Int64(playerController.currentTime),
+            durationSecs: Int64(playerController.duration),
+            // A file still opening reports not playing; shown as paused, it
+            // was the first thing Discord drew for every episode.
+            paused: !playerController.isPlaying && !playerController.awaitingNewFile
+        ))
     }
 
     /// The one place that follows "is an episode playing right now": every
@@ -533,6 +730,17 @@ extension AppModel {
     /// lifetime is "while video is on" hangs off this so a pause, a
     /// transition and a close cannot each forget one of them.
     func syncPlaybackSession() {
+        #if os(iOS)
+        // Before the early return so a closed stream also ends the session
+        // and hands the route back to whatever was playing before.
+        if activeStreamURL != nil {
+            AudioSessionCoordinator.shared.begin(controller: playerController)
+        } else {
+            AudioSessionCoordinator.shared.end()
+        }
+        // A minimised player is a bar over the tabs, which are portrait.
+        OrientationLock.apply(playerOpen: activeStreamURL != nil && !isPlayerMinimized)
+        #endif
         guard activeStreamURL != nil else {
             sleepBlocker.release()
             nowPlaying.clear()
@@ -680,18 +888,16 @@ extension AppModel {
 
     /// Handles real-time playback position changes from the player and records to SQLite.
     ///
-    /// The Discord Rich Presence write and the SQLite progress write are both
-    /// blocking calls into the Rust core — `discord_rich_presence`'s IPC
-    /// write can stall for as long as Discord's own read side does, and this
-    /// used to run synchronously on the main thread on every pause/resume
-    /// and once a second during playback. A single slow Discord write froze
-    /// the whole player: mpv had already paused internally, but the redraw
-    /// mpv's update callback queues onto the main thread (see
-    /// `MpvSurface`'s render callback) couldn't run until the blocked
-    /// call returned, so the screen and the play/pause button both sat
-    /// frozen for however long that took. Both calls are dispatched off the
-    /// main thread below; only the cheap bookkeeping (dedup flags,
-    /// `ContinuityManager`) stays synchronous.
+    /// The SQLite progress write is a blocking call into the Rust core, and
+    /// this used to make it, and a Discord presence write, synchronously on
+    /// the main thread on every pause/resume and once a second. A single slow
+    /// Discord write froze the whole player: mpv had already paused
+    /// internally, but the redraw mpv's update callback queues onto the main
+    /// thread (see `MpvSurface`'s render callback) couldn't run until the
+    /// blocked call returned, so the screen and the play/pause button both
+    /// sat frozen for however long that took. The progress write is
+    /// dispatched off the main thread below; presence only hands state to the
+    /// engine's worker, which owns the socket.
     public func handlePlaybackPositionChange(currentTime: Double, duration: Double) {
         guard let catalogId = currentPlaybackCatalogId,
               let episode = currentPlaybackEpisode,
@@ -773,7 +979,10 @@ extension AppModel {
                 )
                 Task.detached(priority: .utility) {
                     do {
-                        _ = try await engine.resolveStream(req: req)
+                        let handle = try await engine.resolveStream(req: req)
+                        await MainActor.run {
+                            self.nextEpisodePreloaded(catalogId: catalogId, episode: next, url: handle.url)
+                        }
                     } catch {
                         // A failed preload costs nothing visible: the real
                         // play resolves cold exactly as it did before.
@@ -809,10 +1018,18 @@ extension AppModel {
             return
         }
 
+        if !hasLoggedAutoNextGates, duration > 0,
+           duration - currentTime <= PlayerController.countdownTailSeconds {
+            hasLoggedAutoNextGates = true
+            let outro = playerController.outroStartTime.map { "\(Int($0))s" } ?? "none"
+            print("[autonext] ep \(episode) at \(Int(currentTime))s of \(Int(duration))s: autoplay=\(playerController.autoPlayNextEnabled) hasNext=\(playerController.hasNextEpisode) episodes=\(playbackEpisodes.count) completionRules=\(completionRulesApply) countdown=\(playerController.nextEpisodeCountdown.phase) outroStart=\(outro) mini=\(playerController.isMiniPlayerActive)")
+        }
+
         if !hasAutoAdvancedEpisode, !playerController.nextEpisodeCountdown.isResolved,
            completionRulesApply, Double(dur) - currentTime <= Self.autoAdvanceRemainingSeconds,
            playerController.autoPlayNextEnabled, playerController.hasNextEpisode {
             hasAutoAdvancedEpisode = true
+            print("[autonext] end of ep \(episode) at \(Int(currentTime))s of \(Int(duration))s, playing next")
             Task { await self.playAdjacentEpisode(offset: 1) }
         }
 
@@ -832,27 +1049,13 @@ extension AppModel {
         }
 
         let title = currentPlaybackTitle ?? (currentPlaybackCatalog == .anilist ? "Anime" : "Film")
-        let episodeTitle = playbackEpisodes.first(where: { $0.number == Int(episode) })?.title
-            ?? (currentPlaybackCatalog == .tmdbMovie ? title : "")
-        let totalEpisodes = Int64(selectedMediaDetails?.episodeCount ?? 0)
         let catalog = currentPlaybackCatalog
-        // Read here rather than inside the closure: the queue runs behind
-        // whatever a stalled Discord write is doing, so a value read there
-        // is the setting as of whenever that unblocks, not as of this tick.
-        let discordEnabled = Self.isDiscordPresenceEnabled
+
+        // Every tick, inline: the engine only swaps the wanted state under a
+        // mutex and its worker decides whether Discord needs a write.
+        publishPlaybackPresence()
 
         engineIOQueue.async {
-            if pauseEdgeChanged, discordEnabled {
-                engine.discordSetPresence(
-                    title: title,
-                    episode: episode,
-                    episodeTitle: episodeTitle,
-                    totalEpisodes: totalEpisodes,
-                    pos: stopTime,
-                    duration: dur,
-                    paused: isPaused
-                )
-            }
             if secondChanged {
                 try? engine.recordProgress(
                     catalog: catalog,
@@ -861,16 +1064,15 @@ extension AppModel {
                     stopTime: stopTime,
                     duration: dur
                 )
-                if !isPaused, discordEnabled {
-                    engine.discordSetPresence(
-                        title: title,
-                        episode: episode,
-                        episodeTitle: episodeTitle,
-                        totalEpisodes: totalEpisodes,
-                        pos: stopTime,
-                        duration: dur,
-                        paused: false
-                    )
+                // The torrent's on-disk map for the seek bar, on this queue
+                // because it is a synchronous FFI call like the two around
+                // it. Empty for a downloaded file (nothing is pinned), in
+                // which case mpv's own ranges are the whole bar.
+                let onDisk = engine.playingFileBuffered().map {
+                    BufferedSpan(start: $0.start, end: $0.end)
+                }
+                DispatchQueue.main.async {
+                    self.playerController.torrentBufferedFractions = onDisk
                 }
             }
         }
@@ -954,13 +1156,13 @@ extension AppModel {
         // that.
         releaseRemoteStream()
         #endif
-        // Both calls are IPC writes into the Rust engine — `recordProgress`
-        // hits SQLite, `discordClearPresence` hits Discord's socket, and the
-        // comment on `handlePlaybackPositionChange` already documents that a
-        // slow Discord read side can stall a call like this for as long as
-        // Discord takes to answer. Closing the player is the one action a
-        // viewer expects to be instant; running these inline on the main
-        // actor reintroduces the exact freeze that method was detached to fix.
+        // Inline and ahead of the queue: it returns at once, and a play
+        // started right after this close must not have its presence wiped by
+        // a clear that ran later.
+        engine?.discordClearPresence(source: .playback)
+        // `recordProgress` hits SQLite, which can stall. Closing the player is
+        // the one action a viewer expects to be instant, so it stays off the
+        // main actor.
         if let engine, let catalogId = currentPlaybackCatalogId, let episode = currentPlaybackEpisode {
             let dur = Int64(playerController.duration)
             let rawStop = Int64(playerController.currentTime)
@@ -974,10 +1176,7 @@ extension AppModel {
                     stopTime: stopTime,
                     duration: dur
                 )
-                engine.discordClearPresence()
             }
-        } else if let engine {
-            engineIOQueue.async { engine.discordClearPresence() }
         }
         // Release the playing-file pin and pause the session's torrents.
         // Without it a closed player kept downloading the rest of the
@@ -1187,6 +1386,10 @@ extension AppModel {
         // Cleared up front rather than left showing the previous episode's
         // skip window for however long the fetch below takes.
         self.playerController.setAniSkipTimes(nil)
+        self.playerController.aniSkipStatus = nil
+        self.playerController.clearDetectedSkips()
+        skipDetectionTask?.cancel()
+        skipDetectionTask = nil
         aniSkipAwaitingDuration = false
         // Same reasoning: a new episode's overlay shouldn't briefly letterbox
         // itself against the last episode's aspect ratio before mpv reports
@@ -1442,27 +1645,7 @@ extension AppModel {
             timePositionSeconds: playerController.currentTime
         )
 
-        if Self.isDiscordPresenceEnabled {
-            // On `engineIOQueue` like the clear in `stopPlayback`: issued
-            // inline, this set could run while a queued clear was still
-            // waiting behind a stalled write, and the clear then landed
-            // after it and wiped the new episode's presence.
-            let episodeTitle = playbackEpisodes.first(where: { $0.number == Int(episode) })?.title ?? ""
-            let totalEpisodes = Int64(selectedMediaDetails?.episodeCount ?? 0)
-            let pos = Int64(playerController.currentTime)
-            let duration = Int64(playerController.duration)
-            engineIOQueue.async {
-                engine.discordSetPresence(
-                    title: effectiveTitle,
-                    episode: episode,
-                    episodeTitle: episodeTitle,
-                    totalEpisodes: totalEpisodes,
-                    pos: pos,
-                    duration: duration,
-                    paused: false
-                )
-            }
-        }
+        publishPlaybackPresence()
 
         return streamURL
     }
@@ -1600,5 +1783,28 @@ extension AppModel {
         playerController.awaitingNewFile = true
         playerController.isPlaying = true
         activeStreamURL = URL(fileURLWithPath: path)
+        // The real play path syncs from `resolveAndPlay`; without this the
+        // debug file skipped the audio session and the orientation lock, so
+        // the simulator check of either would have passed on nothing.
+        syncPlaybackSession()
+    }
+}
+
+extension AppModel {
+    /// The playing torrent as stream details rows; empty for a file with no
+    /// swarm behind it (a download).
+    nonisolated static func torrentDetailRows(_ stats: PlayingTorrentStats?) -> [StreamDetailRow] {
+        guard let stats else { return [] }
+        func mb(_ bytes: UInt64) -> String { String(format: "%.0f MB", Double(bytes) / 1_048_576) }
+        var rows: [StreamDetailRow] = []
+        if let name = stats.torrentName { rows.append(StreamDetailRow("Torrent", name)) }
+        if let file = stats.fileName { rows.append(StreamDetailRow("File", file)) }
+        let percent = stats.fileBytes > 0 ? Double(stats.fileDownloadedBytes) / Double(stats.fileBytes) * 100 : 0
+        rows.append(StreamDetailRow("On disk", "\(mb(stats.fileDownloadedBytes)) of \(mb(stats.fileBytes)) (\(String(format: "%.1f", percent))%)"))
+        rows.append(StreamDetailRow("Swarm", stats.finished
+            ? "complete, \(stats.state)"
+            : String(format: "%@, %.2f MiB/s down, %.2f MiB/s up", stats.state, stats.downloadMibPerSec, stats.uploadMibPerSec)))
+        rows.append(StreamDetailRow("Peers", "\(stats.peersLive) live, \(stats.peersConnecting) connecting, \(stats.peersSeen) seen"))
+        return rows
     }
 }

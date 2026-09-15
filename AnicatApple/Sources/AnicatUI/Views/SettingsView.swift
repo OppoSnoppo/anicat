@@ -150,6 +150,7 @@ public struct SettingsView: View {
         .init(label: "Theme", card: "Appearance", tab: .general),
         .init(label: "Follow System Appearance", card: "Appearance", tab: .general),
         .init(label: "Appearance", card: "Appearance", tab: .general),
+        .init(label: "Poster Accent", card: "Appearance", tab: .general),
         .init(label: "Time Format", card: "Appearance", tab: .general),
         .init(label: "Keyboard shortcuts cheat sheet", card: "Keyboard Shortcuts", tab: .general),
 
@@ -169,6 +170,7 @@ public struct SettingsView: View {
 
         .init(label: "New Episode Alerts", card: "Notifications", tab: .sharing),
         .init(label: "Discord Rich Presence", card: "Presence", tab: .sharing),
+        .init(label: "Show on Profile", card: "Presence", tab: .sharing),
         .init(label: "Paired iPhones", card: "Devices", tab: .sharing),
 
         .init(label: "AniList account", card: "AniList", tab: .accounts),
@@ -339,6 +341,7 @@ private struct GeneralTabSection: View {
     // Settings ever looked up, so every one of them was a control that
     // changed nothing. They come back with the feature that reads them.
     @AppStorage("anicat_time_format") private var selectedTimeFormat: String = "24-hour"
+    @AppStorage("anicat_poster_accent") private var posterAccentEnabled: Bool = true
     // The appearance controls gate view *structure* on `skin.hasLight` and on
     // `appearance`, so both reads have to be observed ones.
     @State private var themeStore = ThemeStore.shared
@@ -391,6 +394,16 @@ private struct GeneralTabSection: View {
                         )
                     }
                 }
+            }
+
+            Divider()
+                .background(SumiTheme.border)
+
+            SettingField(
+                label: "Poster Accent",
+                description: "Tint the accent to the cover of the title you have open. Off keeps the skin's own colour everywhere."
+            ) {
+                SumiSwitch(isOn: $posterAccentEnabled)
             }
 
             Divider()
@@ -723,6 +736,8 @@ private struct SharingTabSection: View {
     @AppStorage("anicat_notify_new_episodes") private var notifyNewEpisodes: Bool = true
     // Same literal-key constraint. `AppModel` owns the reader and default.
     @AppStorage("anicat_discord_presence") private var discordPresence: Bool = true
+    // Same literal-key constraint; `AppModel.discordPresenceDetail` reads it.
+    @AppStorage("anicat_discord_presence_detail") private var discordPresenceDetail: String = "full"
     // Read once into state rather than off `UserDefaults` in the body: the
     // paired list is written by `RemoteHost` from a socket callback, which
     // no `@AppStorage` array binding observes.
@@ -742,9 +757,23 @@ private struct SharingTabSection: View {
         SettingsCard(title: "Presence") {
             SettingField(
                 label: "Discord Rich Presence",
-                description: "Show the title, episode and position you are watching on your Discord profile. Has no effect when Discord is not running."
+                description: "Show what you are watching or reading on your Discord profile. Picks Discord up whenever it is running, including when it starts after Anicat."
             ) {
                 SumiSwitch(isOn: $discordPresence)
+            }
+
+            SettingField(
+                label: "Show on Profile",
+                description: discordPresenceDetail == "private"
+                    ? "Only \"Watching anime\" or \"Reading manga\" and the time. No title, cover or link."
+                    : "The title, episode or chapter, cover art, and a link to its AniList or TMDB page. Everyone who can see your Discord profile sees it."
+            ) {
+                SumiSegmentedControl(
+                    options: [("full", "Title"), ("private", "Private")],
+                    selection: $discordPresenceDetail
+                )
+                .disabled(!discordPresence)
+                .opacity(discordPresence ? 1 : 0.5)
             }
         }
 
@@ -798,7 +827,7 @@ private struct AccountTabSection: View {
                                 .aspectRatio(contentMode: .fill)
                         } else {
                             ZStack {
-                                Color(hex: "#161310")
+                                SumiTheme.card
                                 Image(systemName: "person.fill")
                                     .font(.system(size: 24))
                                     .foregroundColor(SumiTheme.muted)
@@ -960,7 +989,7 @@ private struct AccountTabSection: View {
                         } label: {
                             Text("Save & Connect")
                                 .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(Color(hex: "#161310"))
+                                .foregroundColor(SumiTheme.background)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
                                 .background(SumiTheme.indigo)

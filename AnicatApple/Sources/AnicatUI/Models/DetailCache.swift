@@ -122,6 +122,20 @@ enum DetailCache {
         return (peeked.details.title, peeked.details.coverURL)
     }
 
+    /// The banner still alone, for the Up Next spotlight. `MediaSummary`
+    /// (what the list query returns) carries no banner, and the queue is
+    /// built from it; the snapshot of a title the viewer has opened does.
+    /// Same two-field mirror and no mtime touch as `peekTitle`.
+    static func peekBanner(id: Int64, isManga: Bool, catalog: MediaCard.CardCatalog = .anilist) -> URL? {
+        struct BannerOnly: Decodable {
+            struct Details: Decodable { let bannerURL: URL? }
+            let details: Details
+        }
+        guard let data = try? Data(contentsOf: fileURL(id: id, isManga: isManga, catalog: catalog)),
+              let peeked = try? JSONDecoder().decode(BannerOnly.self, from: data) else { return nil }
+        return peeked.details.bannerURL
+    }
+
     /// Whether `episode` exists yet, as far as the snapshot knows: the row's
     /// own `isAired` when the list has the row, the episode count when it
     /// does not, and `nil` when there is no snapshot to ask. `nil` is a

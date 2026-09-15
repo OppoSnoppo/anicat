@@ -54,8 +54,27 @@ public enum ResponsiveScrollingPatch {
         let originalMove = unsafeBitCast(method_getImplementation(moveMethod), to: MoveFn.self)
         let moveBlock: @convention(block) (AnyObject, AnyObject?) -> Void = { object, window in
             if window != nil, object_getClass(object) == cls, let scrollView = object as? NSScrollView {
+                // By the axes it scrolls, asked the way AppKit asks: the
+                // scroller flags are both false for a `showsIndicators:
+                // false` strip, which is every shelf, tab strip and season
+                // picker in the app, so by the flags nothing was ever a
+                // shelf and every horizontal strip stayed on the responsive
+                // path. Seen in the log on 2026-09-14: the detail page's
+                // tab strip, season picker and studio shelf all "page
+                // (responsive)", and vertical scrolling over the strip
+                // stalled the way the comment above measured.
+                // "Wants horizontal" alone: a horizontal strip answers yes
+                // to both axes (logged: "wants h yes v yes" for the tab
+                // strip, the season picker and a 1856pt shelf), and the
+                // vertical page is the only one that answers no to it.
                 let isShelf = MainActor.assumeIsolated {
-                    scrollView.hasHorizontalScroller && !scrollView.hasVerticalScroller
+                    scrollView.wantsForwardedScrollEvents(for: .horizontal)
+                }
+                MainActor.assumeIsolated {
+                    let doc = scrollView.documentView?.frame.size ?? .zero
+                    let wantsH = scrollView.wantsForwardedScrollEvents(for: .horizontal)
+                    let wantsV = scrollView.wantsForwardedScrollEvents(for: .vertical)
+                    PlayerLog.write(String(format: "[scroll] joins window: wants h %@ v %@ h-scroller %@ v-scroller %@ document %.0fx%.0f -> %@", wantsH ? "yes" : "no", wantsV ? "yes" : "no", scrollView.hasHorizontalScroller ? "yes" : "no", scrollView.hasVerticalScroller ? "yes" : "no", doc.width, doc.height, isShelf ? "shelf (non-responsive)" : "page (responsive)"))
                 }
                 if isShelf { object_setClass(object, shelfClass) }
             }

@@ -361,6 +361,10 @@ public struct MediaDetailView: View {
     }
 
     @State private var selectedTab: DetailTab = .episodes
+    /// Where the Play button was pressed and how many times, for the Metal
+    /// ripple (`rippleOnPress`); same wiring as `MediaCard`.
+    @State private var playPressLocation: CGPoint = .zero
+    @State private var playPressCount = 0
     let onTabChanged: (DetailTab) -> Void
     // Backed by the same defaults key Settings writes and `AppModel` reads
     // when building a `StreamRequest`, rather than view-local state nothing
@@ -404,6 +408,10 @@ public struct MediaDetailView: View {
     @State private var downloadToastTask: Task<Void, Never>?
     @Environment(\.studioPageActions) private var studioPageActions
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(ThemeStore.posterAccentKey) private var posterAccentEnabled = true
+    /// Observed so the accent task re-runs when the palette flips sides: the
+    /// same hue is drawn at 0.87 brightness on Ink and 0.54 on Paper.
+    @State private var themeStore = ThemeStore.shared
     @Namespace private var detailTabNamespace
     @Namespace private var viewModeNamespace
     @Namespace private var audioNamespace
@@ -749,15 +757,28 @@ public struct MediaDetailView: View {
     private var scrollBody: some View {
         ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 0) {
-                banner
-                content
+                VStack(alignment: .leading, spacing: 0) {
+                    banner
+                    content
+                }
+                .background(alignment: .top) { heroBackdrop }
                 tabsSection
                 moreFromStudio
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .scrollPassedThreshold(Self.compactHeaderThreshold, passed: $isHeaderCompact)
+        .scrollLagProbe("detail")
         .background(SumiTheme.background)
+        .task(id: AccentKey(cover: details.coverURL, isLight: themeStore.palette.isLight, enabled: posterAccentEnabled)) {
+            await followPosterAccent()
+        }
+        // Keyed on the cover, not the page: a clear that arrives after the
+        // next title's set is dropped by the store, see `setAccentOverride`.
+        .onDisappear {
+            PlayerLog.write("[accent] disappear \(details.id)")
+            ThemeStore.shared.releaseAccentOverride(owner: details.coverURL?.absoluteString ?? "")
+        }
         #if os(macOS)
         .onAppear {
             _ = ScrollPocketWorkaround.disableScrollPocketsOnce
@@ -774,46 +795,56 @@ public struct MediaDetailView: View {
         }
     }
 
+    // MARK: - Poster accent
+
+    private struct AccentKey: Hashable {
+        var cover: URL?
+        var isLight: Bool
+        var enabled: Bool
+    }
+
+    /// Hands the cover's hue to the theme store.
+    ///
+    /// Reads the cover through the image cache at the poster's own size, so
+    /// on the usual path (poster already decoded for the page) this is a
+    /// cache hit and a 1536-pixel pass; only a page opened before its card
+    /// was ever drawn pays for a decode here.
+    private func followPosterAccent() async {
+        let owner = details.coverURL?.absoluteString ?? ""
+        PlayerLog.write("[accent] follow \(details.id) enabled \(posterAccentEnabled) cover \(owner.suffix(40))")
+        guard posterAccentEnabled,
+              let cover = details.coverURL,
+              let image = await ImageDecodeCache.shared.image(for: cover, maxPixelSize: 600),
+              !Task.isCancelled else {
+            ThemeStore.shared.setAccentOverride(nil, owner: owner)
+            return
+        }
+        let accent = PosterAccent.accent(for: image, isLight: themeStore.palette.isLight)
+        ThemeStore.shared.setAccentOverride(accent, owner: owner)
+    }
+
     // MARK: - Banner
 
+    /// How far down the page the banner still reaches: 64pt past the old
+    /// 288pt clip. Not further: the still is drawn `.fill` into this
+    /// height, and an AniList banner is about 4.75:1, so every extra point
+    /// of height is more zoom and less picture. At 588pt the crop had lost
+    /// the title logo off the left edge and the owner called it too much;
+    /// at 400pt still too much. 352 keeps the framing within a fifth of
+    /// the old one.
+    private static let heroHeight: CGFloat = 288 + 64
+
+    /// The banner's 288pt layout slot. The still itself is not in here: it
+    /// is `heroBackdrop`, drawn behind this slot and the poster row as one
+    /// image, so there is no edge at 288pt to hide.
     private var banner: some View {
         ZStack(alignment: .topLeading) {
-            SumiTheme.background
-
-            // AsyncImage given a directly-flexible `.frame(maxWidth: .infinity)`
-            // measured a specific banner (a portrait-leaning image scaled up
-            // via `.fill`) as needing ~1150pt of width regardless of the
-            // proposal, and being the outermost element of a freshly-`.id()`d
-            // view, that ideal width won the negotiation with RootView's
-            // HStack instead of losing to it — the page rendered 1150pt wide
-            // starting at the window's left edge, over the sidebar. Every
-            // other AsyncImage in this file (poster, episode thumbnails,
-            // character portraits) sidesteps this by overlaying the image
-            // onto an already-concretely-sized base instead of framing the
-            // image itself; matching that pattern here fixed it.
+            // The slot keeps its height without content so the page's
+            // layout (`bannerOverlap`, the compact-header threshold) is
+            // unchanged from when the still was drawn in it.
             Color.clear
                 .frame(maxWidth: .infinity)
                 .frame(height: 288)
-                .overlay { bannerContent }
-                .clipped()
-
-            // `.hero-gradient`: the page ground at the bottom, a 60% black at
-            // 40% up, clear at the top. Dropped while the trailer plays: it
-            // exists to keep the title legible over a still, and over moving
-            // video it only dims the thing the viewer asked to watch.
-            if !isTrailerOpen {
-                LinearGradient(
-                    stops: [
-                        .init(color: SumiTheme.background, location: 0),
-                        .init(color: Color(red: 5/255, green: 5/255, blue: 5/255).opacity(0.6), location: 0.40),
-                        .init(color: .clear, location: 1),
-                    ],
-                    startPoint: .bottom,
-                    endPoint: .top
-                )
-                .frame(height: 288)
-                .allowsHitTesting(false)
-            }
 
             // Top Left Back Button
             VStack(alignment: .leading) {
@@ -850,7 +881,6 @@ public struct MediaDetailView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .frame(height: 288)
-        .clipped()
         // On the whole banner rather than on the web view itself: a
         // `WKWebView` is a child `NSView` with its own tracking areas, and
         // whether SwiftUI still sees the pointer over it is not something to
@@ -858,37 +888,78 @@ public struct MediaDetailView: View {
         .stableHover { isTrailerHovered = $0 }
     }
 
-    /// The banner still. The trailer used to replace it here; it now opens
-    /// as an overlay from `body`, so the hero never draws over an embed.
-    @ViewBuilder
-    private var bannerContent: some View {
-        bannerImage
-    }
-
-    /// The banner still, moving at half the scroll speed and dimming as it
-    /// goes.
+    /// The banner still, behind the banner slot and the poster row as one
+    /// picture, dissolving into the page ground on the way down.
     ///
-    /// The effect is on the image and never on the 288pt container around it:
-    /// shifting the container down uncovers the bottom of the banner, while
-    /// the gap this leaves at the image's own top is always half the distance
-    /// already scrolled off screen and so can never be seen. `visualEffect`
-    /// reads the offset without publishing it, so none of this reaches the
-    /// page body — no state, no scroll tick.
-    private var bannerImage: some View {
+    /// It used to be clipped at 288pt with a gradient to the ground on its
+    /// last 115pt, and the poster and title sat on flat ground under it, so
+    /// the header read as an image with a page stapled below. Two attempts
+    /// to hide that edge with a separate wash under the banner left a
+    /// visible seam each time, because two layers meeting at a line are a
+    /// line however their colours are matched. One image with one mask has
+    /// no line to match: the mask holds the picture in the top of the
+    /// banner, dims it under the title (the old `.hero-gradient` stops,
+    /// which is what kept the title legible), and runs it out to nothing
+    /// where the poster row begins.
+    ///
+    /// The mask is a gradient to clear, not to the ground colour: on Paper
+    /// the old gradient's hard-coded near-black darkened the ground the dark
+    /// title needed lightened, and letting the page show through instead
+    /// is right on every skin.
+    ///
+    /// Parallax and dimming are on the image and never on the frame around
+    /// it: shifting the frame down uncovers the bottom of the still, while
+    /// the gap this leaves at the image's own top is always half the
+    /// distance already scrolled off screen and so can never be seen.
+    /// `visualEffect` reads the offset without publishing it, so none of
+    /// this reaches the page body -- no state, no scroll tick.
+    private var heroBackdrop: some View {
         // Read out here because the effect closure is @Sendable and cannot
         // reach back into the view for it.
         let isStill = reduceMotion
-        return CachedAsyncImage(url: details.bannerURL ?? details.coverURL, maxPixelSize: 1200) { image in
-            image.resizable().aspectRatio(contentMode: .fill)
-        } placeholder: {
-            Rectangle().fill(SumiTheme.card)
-        }
-        .visualEffect { content, proxy in
-            let scrolled = max(0, -proxy.frame(in: .scrollView).minY)
-            return content
-                .offset(y: isStill ? 0 : scrolled * 0.5)
-                .brightness(-min(0.18, scrolled / 1600))
-        }
+        let mask = LinearGradient(
+            stops: [
+                .init(color: .black, location: 0),
+                // The old gradient's stops: 40% of the picture left under
+                // the meta line, 12% at the old clip. At 62% the meta line
+                // sat on a bright still and could not be read.
+                .init(color: .black.opacity(0.40), location: 173 / Self.heroHeight),
+                .init(color: .black.opacity(0.15), location: 288 / Self.heroHeight),
+                .init(color: .clear, location: 1),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        // The image is overlaid onto an already-sized base rather than
+        // framed itself: an AsyncImage given a flexible frame measured a
+        // portrait-leaning still as needing ~1150pt of width regardless of
+        // the proposal, and as the outermost element of a freshly-`.id()`d
+        // view that ideal width won against RootView's HStack -- the page
+        // rendered 1150pt wide from the window's left edge, over the sidebar.
+        return Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: Self.heroHeight)
+            .overlay {
+                // 2400, not 1200: the still spans ~1150pt, which is 2300
+                // device pixels on a Retina panel, and a 1200px decode was
+                // being drawn at twice its size -- soft before any zoom,
+                // and visibly low quality once the frame grew. AniList
+                // banners are 1900px wide, so this is their native decode.
+                CachedAsyncImage(url: details.bannerURL ?? details.coverURL, maxPixelSize: 2400) { image in
+                    image.resizable().aspectRatio(contentMode: .fill)
+                } placeholder: {
+                    Rectangle().fill(SumiTheme.card)
+                }
+                .visualEffect { content, proxy in
+                    let scrolled = max(0, -proxy.frame(in: .scrollView).minY)
+                    return content
+                        .offset(y: isStill ? 0 : scrolled * 0.5)
+                        .brightness(-min(0.18, scrolled / 1600))
+                }
+            }
+            .clipped()
+            .mask(mask)
+            .allowsHitTesting(false)
     }
 
     // MARK: - Compact header
@@ -1172,6 +1243,7 @@ public struct MediaDetailView: View {
                         }
                         .padding(.bottom, 4)
                     }
+                    .backSwipeExempt()
                 }
             }
             .padding(.horizontal, 56)
@@ -1226,7 +1298,7 @@ public struct MediaDetailView: View {
                     .fontWeight(.semibold)
             case "FINISHED":
                 Text("FINISHED")
-                    .foregroundColor(Color(hex: "#34D399"))
+                    .foregroundColor(SumiTheme.success)
                     .fontWeight(.semibold)
             default:
                 EmptyView()
@@ -1352,10 +1424,19 @@ public struct MediaDetailView: View {
                     .frame(height: 40)
                     .background(SumiTheme.indigo)
                     .clipShape(RoundedRectangle(cornerRadius: SumiTheme.radiusLg))
+                    .rippleOnPress(at: playPressLocation, trigger: playPressCount)
                     .shadow(color: SumiTheme.indigo.opacity(0.10), radius: 10, y: 3)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.sumiPressable)
+                // Alongside the Button's own tap, never instead of it: the
+                // ripple wants the press point, the Button decides the play.
+                .simultaneousGesture(
+                    SpatialTapGesture().onEnded { value in
+                        playPressLocation = value.location
+                        playPressCount += 1
+                    }
+                )
                 .disabled(resumeTarget == nil)
                 .opacity(resumeTarget == nil ? 0.5 : 1)
 
@@ -1500,13 +1581,13 @@ public struct MediaDetailView: View {
             Button(action: onToggleFavourite) {
                 Image(systemName: details.isFavourite ? "heart.fill" : "heart")
                     .font(.system(size: 15))
-                    .foregroundColor(details.isFavourite ? Color(hex: "#EC4899") : SumiTheme.foreground.opacity(0.8))
+                    .foregroundColor(details.isFavourite ? SumiTheme.favourite : SumiTheme.foreground.opacity(0.8))
                     .frame(width: 40, height: 40)
-                    .background(details.isFavourite ? Color(hex: "#EC4899").opacity(0.15) : SumiTheme.card)
+                    .background(details.isFavourite ? SumiTheme.favourite.opacity(0.15) : SumiTheme.card)
                     .clipShape(RoundedRectangle(cornerRadius: SumiTheme.radiusMd))
                     .overlay(
                         RoundedRectangle(cornerRadius: SumiTheme.radiusMd)
-                            .stroke(details.isFavourite ? Color(hex: "#EC4899").opacity(0.3) : SumiTheme.border, lineWidth: 1)
+                            .stroke(details.isFavourite ? SumiTheme.favourite.opacity(0.3) : SumiTheme.border, lineWidth: 1)
                     )
                     .contentShape(Rectangle())
             }
@@ -1721,6 +1802,7 @@ public struct MediaDetailView: View {
             }
             .padding(.vertical, 2)
         }
+        .backSwipeExempt()
     }
 
     /// A film: one sitting, numbered 1 only because the registry, the resume
@@ -1995,6 +2077,7 @@ public struct MediaDetailView: View {
                     }
                 }
             }
+            .backSwipeExempt()
 
             Spacer(minLength: 12)
 
@@ -3566,7 +3649,9 @@ private struct EpisodeRow: View, Equatable {
             if let minutes = episode.runtimeMinutes, minutes > 0 {
                 Text("\(minutes)m")
                     .sumiTabularMono(size: 9)
-                    .foregroundColor(Color(hex: "#CCCCCC"))
+                    // Over its own black chip, not the page: white at 80%
+                    // whatever the skin, like the `23m` badge on a poster.
+                    .foregroundColor(Color.white.opacity(0.8))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
                     .background(Color.black.opacity(0.8))
@@ -3816,7 +3901,13 @@ private struct ServerPickerView: View {
                 // list whose shape you could not see; 560 shows nine and
                 // still leaves room above and below the anchored row on a
                 // laptop display.
-                .frame(maxHeight: 560)
+                //
+                // A height, not a `maxHeight`: a popover sizes itself to its
+                // content's ideal size, and a ScrollView's ideal height is
+                // next to nothing, so under `maxHeight` the list collapsed to
+                // one clipped row (six releases found, one half-visible name
+                // and no seeders line).
+                .frame(height: min(CGFloat(candidates.count) * 62, 560))
             }
         }
         .frame(width: 460)

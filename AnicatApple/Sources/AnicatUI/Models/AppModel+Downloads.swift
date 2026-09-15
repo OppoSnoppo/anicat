@@ -217,6 +217,7 @@ extension AppModel {
         // its own (`playAdjacentEpisode`) and otherwise resolves cold.
         hasPreloadedNextEpisode = true
         playerController.setAniSkipTimes(nil)
+        playerController.aniSkipStatus = nil
         aniSkipAwaitingDuration = false
         playerController.videoDisplayWidth = nil
         playerController.videoDisplayHeight = nil
@@ -258,23 +259,6 @@ extension AppModel {
             timePositionSeconds: playerController.currentTime
         )
 
-        if Self.isDiscordPresenceEnabled {
-            // Queued, not inline: see the same call in `resolveAndPlay`.
-            let episodeTitle = playerController.episodeTitle
-            let totalEpisodes = Int64(playbackEpisodes.count)
-            let pos = Int64(playerController.currentTime)
-            let duration = Int64(playerController.duration)
-            engineIOQueue.async {
-                engine.discordSetPresence(
-                    title: title,
-                    episode: episode,
-                    episodeTitle: episodeTitle,
-                    totalEpisodes: totalEpisodes,
-                    pos: pos,
-                    duration: duration,
-                    paused: false
-                )
-            }
-        }
+        publishPlaybackPresence()
     }
 }

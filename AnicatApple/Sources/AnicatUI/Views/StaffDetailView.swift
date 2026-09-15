@@ -102,9 +102,13 @@ struct StaffDetailView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                HStack(spacing: 6) {
-                    ForEach(metaBadges, id: \.self) { badge in
-                        StatusBadge(.neutral(badge))
+                // Scrolls rather than wraps: a badge is one fact, and a
+                // fact split over two lines reads as two.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(metaBadges, id: \.self) { badge in
+                            StatusBadge(.neutral(badge))
+                        }
                     }
                 }
                 .padding(.top, 2)
@@ -190,7 +194,10 @@ private struct StaffCharacterCreditRow: View {
                     }
                     Spacer(minLength: 0)
                 }
-                .frame(width: 220, alignment: .leading)
+                // A width on the Mac, where the row sits beside a grid; a
+                // cap on the phone, where 220 plus the 52pt thumb inside a
+                // 402pt page pushed the grid off the right edge.
+                .frame(maxWidth: 220, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.sumiPressable)

@@ -31,7 +31,7 @@ thiserror = "2"
 regex-lite = "0.1"
 dirs = "6"
 tokio-util = { version = "0.7", features = ["io"] }
-discord-rich-presence = "0.2"
+discord-rich-presence = "1.1"
 # Installed by `AnicatEngine::new` so core's `log::` lines reach stderr in
 # the app. Nothing else routed them anywhere: every `[resolve]` timing line
 # was being dropped on the floor in the Swift build.

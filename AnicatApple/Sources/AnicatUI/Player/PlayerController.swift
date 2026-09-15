@@ -88,7 +88,7 @@ public final class PlayerController {
         return w / h
     }
 
-    /// The video surface's own real on-screen size (`MpvRenderView.bounds`),
+    /// The video surface's own real on-screen size (`MpvMetalView.bounds`),
     /// reported directly by that view rather than measured a second time via
     /// a separate SwiftUI `GeometryReader` — see `reportContainerSize`'s doc
     /// comment on why the two can disagree.
@@ -100,6 +100,34 @@ public final class PlayerController {
     // (buffering is driven by the torrent pre-buffer gate in core, which is
     // seconds not milliseconds; a bare spinner reads as hung over that long).
     public var bufferingPercent: Int? = nil
+    /// What mpv holds in its own demuxer cache, in seconds
+    /// (`demuxer-cache-state/seekable-ranges`). Bounded by the 128 MB
+    /// cache window, so on its own it understates a torrent that has
+    /// fetched far ahead of the playhead.
+    public var mpvBufferedRanges: [BufferedSpan] = []
+    /// What the torrent has on disk, as fractions of the file. A byte
+    /// fraction is not a time fraction on a VBR encode, but the bitfield
+    /// is the only map there is and a few seconds of slack still draws a
+    /// truthful bar; mpv's ranges above are exact where they overlap.
+    public var torrentBufferedFractions: [BufferedSpan] = []
+    /// The seek bar's buffered segments: the two sources above merged, in
+    /// seconds. Empty until the duration is known.
+    public var bufferedRanges: [BufferedSpan] {
+        guard duration > 0 else { return [] }
+        let scaled = torrentBufferedFractions.map {
+            BufferedSpan(start: $0.start * duration, end: $0.end * duration)
+        }
+        // A swarm delivers pieces out of order, so the raw map is dozens
+        // of runs a few seconds long with gaps between: drawn as-is the bar
+        // was a dashed line. Gaps under 1.5% of the runtime close (a
+        // 24-minute episode: 22s, about two pieces still in flight) and
+        // runs under 0.4% (a couple of pixels) are dropped; both are noise
+        // to a viewer asking where a seek can land.
+        let gap = duration * 0.015
+        let minimum = duration * 0.004
+        return BufferedSpan.merged(mpvBufferedRanges + scaled, closingGapsUnder: gap)
+            .filter { $0.end - $0.start >= minimum }
+    }
     public var volume: Double = 1.0 // 0 to 1
     public var isMuted: Bool = false
     public var playbackRate: Double = 1.0
@@ -152,6 +180,26 @@ public final class PlayerController {
     public var onSetVolume: (@Sendable (_ volume: Double) -> Void)?
     public var onSetMuted: (@Sendable (_ muted: Bool) -> Void)?
     public var onSetSpeed: (@Sendable (_ rate: Double) -> Void)?
+    /// Drops or restores the video track while audio keeps going. iOS
+    /// terminates a process that submits Metal work from the background,
+    /// and mpv's vo renders on its own thread with no idea the app was
+    /// pocketed -- so a backgrounded episode either loses its picture
+    /// (`vid=no`) or loses the whole process. Wired by the coordinator
+    /// like the others; `AudioSessionCoordinator` is the caller.
+    public var onSetVideoEnabled: (@Sendable (_ enabled: Bool) -> Void)?
+    /// mpv's `sub-scale`. Wired by the coordinator; the value lives in
+    /// UserDefaults so a new file and a new session start at the size the
+    /// viewer picked, and 1.0 leaves the release's own typesetting alone.
+    public var onSetSubtitleScale: (@Sendable (_ scale: Double) -> Void)?
+    public static let subtitleScaleKey = "anicat_subtitle_scale"
+    public static var subtitleScaleSetting: Double {
+        let stored = UserDefaults.standard.double(forKey: subtitleScaleKey)
+        return stored > 0 ? stored : 1.0
+    }
+    public func setSubtitleScale(_ scale: Double) {
+        UserDefaults.standard.set(scale, forKey: Self.subtitleScaleKey)
+        onSetSubtitleScale?(scale)
+    }
 
     // Rotate video 90 degrees — mirrors the mpv Lua script's "sideways mode"
     // (Shift+V) in the Tauri build: 0 = off, 1 = 90 CW, 2 = 90 CCW. Session-
@@ -250,12 +298,13 @@ public final class PlayerController {
     public var skipWindows: [SkipWindow] {
         let chapterWindows = trustedChapterWindows
         var windows = chapterWindows
+        let fallback = fallbackTimes
         if !chapterWindows.contains(where: { $0.kind == .opening }),
-           let start = aniSkipTimes?.introStart, let end = aniSkipTimes?.introEnd, end > start {
+           let start = fallback?.introStart, let end = fallback?.introEnd, end > start {
             windows.append(SkipWindow(start: start, end: end, kind: .opening))
         }
         if !chapterWindows.contains(where: { $0.kind == .ending }),
-           let start = aniSkipTimes?.outroStart, let end = aniSkipTimes?.outroEnd, end > start {
+           let start = fallback?.outroStart, let end = fallback?.outroEnd, end > start {
             windows.append(SkipWindow(start: start, end: end, kind: .ending))
         }
         return windows.sorted { $0.start < $1.start }
@@ -374,6 +423,12 @@ public final class PlayerController {
     /// and a release with a dozen subtitle tracks is well over a hundred of
     /// them.
     public var onFetchTracks: (@Sendable (_ completion: @escaping @Sendable @MainActor (_ audio: [PlayerTrack], _ subtitle: [PlayerTrack]) -> Void) -> Void)?
+    /// Decoder, cache and frame-drop readings for the stream details panel.
+    /// Off the main thread for the same reason as `onFetchTracks`.
+    public var onFetchMpvDetails: (@Sendable (_ completion: @escaping @Sendable @MainActor ([StreamDetailRow]) -> Void) -> Void)?
+    /// The playing torrent's swarm, set by `AppModel` (this module's
+    /// controller does not see the engine's types).
+    public var onFetchTorrentDetails: (@Sendable (_ completion: @escaping @Sendable @MainActor ([StreamDetailRow]) -> Void) -> Void)?
     public var onSelectAudioTrack: (@Sendable (_ id: String) -> Void)?
     /// `nil` is the Off row.
     public var onSelectSubtitleTrack: (@Sendable (_ id: String?) -> Void)?
@@ -504,6 +559,8 @@ public final class PlayerController {
     /// do nothing but change what the *next* episode searches for -- which
     /// reads as a switch that does not work.
     public var onReloadForAudioLanguage: (@MainActor (_ preferDub: Bool) -> Void)?
+    /// The Info popover's "Block & find another" button. See `AppModel.rejectPlayingRelease`.
+    public var onRejectRelease: (@MainActor () -> Void)?
     
     // Autohide controls timer & state
     public var areControlsVisible: Bool = true
@@ -755,6 +812,46 @@ public final class PlayerController {
     /// It no longer simply assigns the four fields: it is called with `nil`
     /// on every AniSkip miss, and chapters — which are the better source and
     /// usually arrive first — would have been wiped by that miss.
+    /// Where the AniSkip half of the skip windows stands for this episode,
+    /// in words, for the stream details panel. Nil for a title AniSkip does
+    /// not cover (films, TV).
+    public var aniSkipStatus: String?
+
+    /// Windows found in the audio itself (`AppModel+SkipDetection`), per
+    /// kind, the last resort after chapters and AniSkip.
+    private var detectedIntro: (start: Double, end: Double)?
+    private var detectedOutro: (start: Double, end: Double)?
+    /// How audio detection stands for this episode, for the details panel.
+    public var skipDetectionStatus: String?
+
+    /// AniSkip's times, with each kind it has none for filled from detection.
+    private var fallbackTimes: AniSkipClient.SkipTimes? {
+        let introFromAniSkip = aniSkipTimes?.introStart != nil
+        let outroFromAniSkip = aniSkipTimes?.outroStart != nil
+        let intro = introFromAniSkip ? (aniSkipTimes?.introStart, aniSkipTimes?.introEnd) : (detectedIntro?.start, detectedIntro?.end)
+        let outro = outroFromAniSkip ? (aniSkipTimes?.outroStart, aniSkipTimes?.outroEnd) : (detectedOutro?.start, detectedOutro?.end)
+        guard intro.0 != nil || outro.0 != nil else { return nil }
+        return AniSkipClient.SkipTimes(introStart: intro.0, introEnd: intro.1, outroStart: outro.0, outroEnd: outro.1)
+    }
+
+    public func setDetectedOpening(start: Double, end: Double) {
+        detectedIntro = (start, end)
+        applySkipSources()
+    }
+
+    public func setDetectedEnding(start: Double, end: Double) {
+        detectedOutro = (start, end)
+        applySkipSources()
+    }
+
+    /// Per episode, with the AniSkip reset in `resolveAndPlay`.
+    public func clearDetectedSkips() {
+        detectedIntro = nil
+        detectedOutro = nil
+        skipDetectionStatus = nil
+        applySkipSources()
+    }
+
     public func setAniSkipTimes(_ times: AniSkipClient.SkipTimes?) {
         aniSkipTimes = times
         skippedWindowKeys.removeAll()
@@ -768,10 +865,11 @@ public final class PlayerController {
         let chapterWindows = trustedChapterWindows
         let chapterIntro = chapterWindows.first { $0.kind == .opening }
         let chapterOutro = chapterWindows.first { $0.kind == .ending }
-        introStartTime = chapterIntro?.start ?? aniSkipTimes?.introStart
-        introEndTime = chapterIntro?.end ?? aniSkipTimes?.introEnd
-        outroStartTime = chapterOutro?.start ?? aniSkipTimes?.outroStart
-        outroEndTime = chapterOutro?.end ?? aniSkipTimes?.outroEnd
+        let fallback = fallbackTimes
+        introStartTime = chapterIntro?.start ?? fallback?.introStart
+        introEndTime = chapterIntro?.end ?? fallback?.introEnd
+        outroStartTime = chapterOutro?.start ?? fallback?.outroStart
+        outroEndTime = chapterOutro?.end ?? fallback?.outroEnd
         checkIntroStatus()
     }
 
@@ -855,6 +953,7 @@ public final class PlayerController {
         // end of the file arms the countdown at a position nothing will ever
         // move past — there is no second tick to expire it in.
         if nextEpisodeCountdown.advance(to: currentTime, duration: duration) {
+            print("[autonext] countdown expired at \(Int(currentTime))s of \(Int(duration))s, playing next")
             onNextEpisode?()
         }
     }
@@ -873,9 +972,34 @@ public final class PlayerController {
         // window's end rather than at its start — and where that end is the
         // end of the file, `advance`'s end-of-file condition is what expires
         // it, since no position-seconds remain to count.
-        let trigger = outroStartTime ?? (duration - Self.countdownTailSeconds)
+        //
+        // With auto-skip off, the ending is something the viewer chose to
+        // watch: armed at its start, the card played the next episode eight
+        // seconds in, which read as auto-skip ignoring its own setting. Then
+        // the card waits for the ending to finish, and never comes earlier
+        // than the plain tail would.
+        let tail = duration - Self.countdownTailSeconds
+        let endingEnd = skipWindows.first(where: { $0.kind == .ending })?.end
+        let trigger = autoSkipEnabled
+            ? (outroStartTime ?? tail)
+            : max(endingEnd ?? tail, tail)
         guard currentTime >= trigger else { return }
         nextEpisodeCountdown.arm(at: currentTime)
+        print("[autonext] countdown armed at \(Int(currentTime))s of \(Int(duration))s (outro start \(outroStartTime.map { String(Int($0)) } ?? "none"))")
+    }
+
+    /// mpv reached the last frame (`eof-reached`). Gives the end-of-episode
+    /// rules one tick at the file's end, because the position ticks may
+    /// never have got there: see the observer in `MpvSurface`. Each rule
+    /// keeps its own once-per-episode guard, so a tick they already acted
+    /// on changes nothing.
+    public func handleEndOfFile() {
+        guard duration > 0, !isScrubbing else { return }
+        let end = max(duration, currentTime)
+        print("[autonext] eof-reached at \(Int(currentTime))s of \(Int(duration))s, countdown \(nextEpisodeCountdown.phase)")
+        currentTime = end
+        checkIntroStatus()
+        onPositionChange?(end, duration)
     }
 
     /// Dismisses the card for this episode. Any key, a click outside it, or
@@ -930,6 +1054,10 @@ public final class PlayerController {
                 // scrubber someone stopped to use is taking away the tool
                 // they reached for.
                 if self.isPlaying {
+                    // Logged next to the nudges: a "blink" that follows this
+                    // line by a frame is the chrome's geometry re-laying the
+                    // video view out.
+                    PlayerLog.write(String(format: "[chrome] auto-hidden at %.1fs", self.currentTime))
                     withAnimation(.smooth) {
                         self.areControlsVisible = false
                     }
@@ -1105,5 +1233,45 @@ public struct PlayerTrack: Identifiable, Sendable, Hashable {
             return (english.first(where: \.isSignsOnly) ?? tracks.first(where: \.isSignsOnly))?.id
         }
         return (english.first(where: { !$0.isSignsOnly }) ?? english.first)?.id
+    }
+}
+
+
+/// A contiguous stretch of the timeline that is already available.
+public struct BufferedSpan: Equatable, Sendable {
+    public var start: Double
+    public var end: Double
+
+    public init(start: Double, end: Double) {
+        self.start = start
+        self.end = end
+    }
+
+    /// Sorted and coalesced; overlapping or touching spans become one, so
+    /// the bar never draws two capsules butted against each other with a
+    /// hairline of track showing between.
+    public static func merged(_ spans: [BufferedSpan], closingGapsUnder gap: Double = 0) -> [BufferedSpan] {
+        let sorted = spans.filter { $0.end > $0.start }.sorted { $0.start < $1.start }
+        var out: [BufferedSpan] = []
+        for span in sorted {
+            if let last = out.last, span.start <= last.end + gap {
+                out[out.count - 1].end = max(last.end, span.end)
+            } else {
+                out.append(span)
+            }
+        }
+        return out
+    }
+}
+
+/// One line of the player's stream details panel.
+public struct StreamDetailRow: Identifiable, Sendable, Hashable {
+    public let label: String
+    public let value: String
+    public var id: String { label }
+
+    public init(_ label: String, _ value: String) {
+        self.label = label
+        self.value = value
     }
 }

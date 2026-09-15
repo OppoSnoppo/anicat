@@ -349,6 +349,14 @@ private struct DownloadRow: View {
         // Leaving the row and coming back should not still be one click away
         // from deleting it.
         .onHover { inside in if !inside { removeConfirming = false } }
+        // No hover on a phone, so the armed state timed out never: a
+        // Remove tapped once and forgotten was still one tap from deleting
+        // the file an hour later.
+        .task(id: removeConfirming) {
+            guard removeConfirming else { return }
+            try? await Task.sleep(for: .seconds(4))
+            if !Task.isCancelled { removeConfirming = false }
+        }
     }
 
     @ViewBuilder

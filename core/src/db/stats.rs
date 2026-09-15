@@ -80,6 +80,10 @@ pub struct WatchStats {
     pub top_titles: Vec<TitleCount>,
     /// 0-23, in the caller's timezone. 0 when there is no history at all.
     pub busiest_hour: i32,
+    /// Episodes started per local hour, index 0 = midnight. `busiest_hour`
+    /// is its argmax; kept as a field because the UI charted one known
+    /// value and 23 blanks before it had the histogram.
+    pub by_hour: Vec<i32>,
     pub first_watch_at: Option<String>,
 }
 
@@ -245,6 +249,7 @@ where
         longest_streak_days: longest_run(&active),
         top_titles,
         busiest_hour,
+        by_hour: by_hour.to_vec(),
         first_watch_at: first_watch.map(|f| f.with_timezone(&tz).to_rfc3339()),
     }
 }
@@ -381,6 +386,10 @@ mod tests {
         assert_eq!(stats.top_titles[1].catalog_id, 2);
         // 14:00 and 14:30 UTC are both 23:00 local.
         assert_eq!(stats.busiest_hour, 23);
+        assert_eq!(stats.by_hour.len(), 24);
+        assert_eq!(stats.by_hour[23], 2);
+        assert_eq!(stats.by_hour[11], 1);
+        assert_eq!(stats.by_hour.iter().sum::<i32>(), 3);
     }
 
     #[test]

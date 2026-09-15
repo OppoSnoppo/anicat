@@ -45,27 +45,6 @@ struct AnicatUITests {
         #expect(controller.activeAnime4KPreset == .on)
     }
 
-    #if os(macOS)
-    // Renders via libmpv's render API into an owned OpenGL context rather
-    // than handing mpv a `wid` — see MpvSurface.swift's doc comment.
-    // There is no subview reparenting to constrain any more (that was the
-    // wid/cocoa-cb design this replaced), so the test now covers what
-    // actually matters here: the view is a real, usable OpenGL surface
-    // before it's ever attached to a window, and mpv isn't touched until
-    // it is (`attachMpv` is only ever called from `viewDidMoveToWindow`).
-    @Test("MpvRenderView creates an accelerated OpenGL context before attaching to a window")
-    @MainActor
-    func testMpvRenderView() {
-        let view = MpvRenderView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
-        #expect(view.window == nil)
-        #expect(view.coordinator == nil)
-        #expect(view.openGLContext != nil)
-
-        view.frame = NSRect(x: 0, y: 0, width: 1280, height: 720)
-        #expect(view.bounds.size == NSSize(width: 1280, height: 720))
-    }
-    #endif
-
     @Test("Sumi Ledger Tokens")
     func testThemeTokens() {
         #expect(SumiTheme.radiusMd == 10)
@@ -166,6 +145,26 @@ struct AnicatUITests {
 
         defaults.set(true, forKey: key)
         #expect(AppModel.isDiscordPresenceEnabled)
+    }
+
+    @Test("Discord presence names drop placeholders and keep their full length")
+    func testDiscordPresenceEpisodeName() {
+        #expect(AppModel.presenceEpisodeName("Killing Magic", number: 3) == "Killing Magic")
+        #expect(AppModel.presenceEpisodeName("Episode 3", number: 3) == nil)
+        #expect(AppModel.presenceEpisodeName("  ", number: 3) == nil)
+        let long = "The Revival of the Time-Honored Classics Club"
+        #expect(AppModel.presenceEpisodeName(long, number: 1) == long)
+    }
+
+    @Test("Discord presence maps an absolute episode to its season")
+    func testDiscordPresenceSeasonPlace() {
+        let seasons = [CinemaSeason(number: 1, episodeCount: 8), CinemaSeason(number: 2, episodeCount: 10)]
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 3, seasons: seasons)! == (1, 3))
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 13, seasons: seasons)! == (2, 5))
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 19, seasons: seasons) == nil)
+        #expect(AppModel.presenceSeasonPlace(absoluteEpisode: 3, seasons: []) == nil)
+        #expect(AppModel.presenceRuntime(seconds: 8340) == "2h 19m")
+        #expect(AppModel.presenceRuntime(seconds: 30) == nil)
     }
 
     @Test("MediaDetailView onClose callback triggers")

@@ -1,7 +1,6 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
-import OpenGL.GL
 #else
 import UIKit
 #endif
@@ -16,56 +15,22 @@ private final class UnsafeSendableBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
-/// How mpv's frames reach the screen.
-///
-/// `.metal` is where both platforms are going: mpv's own `gpu-next` output
-/// through Vulkan, which MoltenVK maps onto Metal, drawing into a
-/// `CAMetalLayer` we own and hand over as `wid`. That needs MPVKit's
-/// libmpv, whose `moltenvk` context (their patch 0001) takes the layer
-/// pointer and creates a Vulkan surface on it: no window, no view of mpv's
-/// own, no render context or render thread of ours. Stock mpv has no such
-/// context; its macOS backend only knows how to open its own window
-/// (tried 2026-09-06 with `macvk`: "[vo/gpu-next] Window size: 1920x1080"
-/// and a fullscreen window nobody asked for).
-///
-/// `.openGL` is the previous path, libmpv's render API into an
-/// `NSOpenGLView` from `MpvRenderTarget`'s thread. MPVKit's macOS build
-/// keeps `gl` enabled, so it still works; it is the escape hatch
-/// (`anicat_render_backend = "opengl"`) if Metal misbehaves on some
-/// machine, and it goes once a release has shipped without needing it.
-/// Anime4K's `glsl-shaders` run inside gpu-next either way.
+/// How mpv's frames reach the screen: mpv's own `gpu-next` output through
+/// Vulkan, which MoltenVK maps onto Metal, drawing into a `CAMetalLayer` we
+/// own and hand over as `wid`. That needs MPVKit's libmpv, whose `moltenvk`
+/// context (their patch 0001) takes the layer pointer and creates a Vulkan
+/// surface on it: no window, no view of mpv's own, no render context or
+/// render thread of ours. Stock mpv has no such context; its macOS backend
+/// only knows how to open its own window (tried 2026-09-06 with `macvk`:
+/// "[vo/gpu-next] Window size: 1920x1080" and a fullscreen window nobody
+/// asked for). The OpenGL render-API path that preceded it was removed after
+/// 6.0.0 and 6.0.1 shipped without anyone needing it.
 ///
 /// Verified on an M4 Pro, macOS 26: video, subtitles, Anime4K, two
 /// open/close cycles, no window of mpv's own, zero libmpv frames on the
 /// main thread under `sample`.
-public enum MpvRenderBackend: String, Sendable {
-    // Declared only on macOS, so every `switch` over this enum elsewhere in
-    // the file is exhaustive on iOS with the Metal case alone — there is no
-    // OpenGL on iOS at all, so an `.openGL` branch there would be a dead
-    // arm the compiler still demands a body for.
-    #if os(macOS)
-    case openGL = "opengl"
-    #endif
-    case metal = "metal"
-
-    static var configured: MpvRenderBackend {
-        #if os(macOS)
-        // The environment wins over defaults so a second process can be
-        // started on the other backend without touching the running
-        // app's setting.
-        let raw = ProcessInfo.processInfo.environment["ANICAT_RENDER_BACKEND"]
-            ?? UserDefaults.standard.string(forKey: "anicat_render_backend")
-            ?? ""
-        return MpvRenderBackend(rawValue: raw) ?? .metal
-        #else
-        // Not a lookup that happens to fail: the escape hatch does not exist
-        // on iOS, so the setting has nothing to select and is ignored.
-        return .metal
-        #endif
-    }
-}
-
-/// The layer mpv draws into on the `.metal` path.
+///
+/// The layer mpv draws into.
 ///
 /// The `drawableSize` override is MPVKit's workaround, carried over: during
 /// a resize MoltenVK briefly forces the drawable to 1x1 to flush a
@@ -91,7 +56,7 @@ final class MpvMetalLayer: CAMetalLayer {
         set {}
     }
 
-    /// The ambient sampler, when the `.metal` backend is active. Every
+    /// The ambient sampler. Every
     /// drawable handed to MoltenVK is registered so its presented handler
     /// can copy the finished picture.
     nonisolated(unsafe) var ambientSampler: AmbientMetalSampler?
@@ -180,6 +145,7 @@ public final class MpvMetalView: NSView {
             PlayerLog.write(String(format: "[metal] bounds %@ scale %.0f drawable %@ superview %@", NSStringFromRect(bounds), scale, NSStringFromSize(metalLayer.drawableSize), superview.map { NSStringFromRect($0.frame) } ?? "-"))
         }
         pendingDrawableSync?.cancel()
+        let changingFullScreen = FullScreenState.shared.isTransitioning
         let target = CGSize(width: bounds.width * scale, height: bounds.height * scale)
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -211,8 +177,7 @@ public final class MpvMetalView: NSView {
                 self.onDrawableSizeChanged?(target)
             }
             self.pendingDrawableReport = report
-            let fullScreen = self.window?.styleMask.contains(.fullScreen) ?? false
-            if fullScreen && self.lastReportedDrawableSize.width > 1 {
+            if changingFullScreen && self.lastReportedDrawableSize.width > 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: report)
             } else {
                 report.perform()
@@ -227,18 +192,27 @@ public final class MpvMetalView: NSView {
         // fullscreen window, seen in the player log on a replay). So: apply
         // now on the first size, and whenever the window is or is becoming
         // fullscreen; debounce only a plain windowed resize.
-        let isFullScreen = window?.styleMask.contains(.fullScreen) ?? false
-        if metalLayer.drawableSize == .zero || metalLayer.drawableSize.width <= 1 || isFullScreen {
+        //
+        // Immediate only while fullscreen is being entered or left, not for
+        // as long as the window is fullscreen: minimizing to the mini-player
+        // and back inside a fullscreen window re-laid this view out about 70
+        // times, each applied, each a swapchain rebuild. Paused, whichever
+        // rebuild came last was never drawn into -- the picture stayed at
+        // 640x360 in the corner of a 3024x1898 layer, over black or magenta,
+        // with mpv's own size check reading the right size. The spring
+        // settles into one rebuild with a trailing 120ms; 50ms fired mid-
+        // spring on a loaded main thread, whose layout steps came 30-40ms
+        // apart.
+        if metalLayer.drawableSize == .zero || metalLayer.drawableSize.width <= 1 || changingFullScreen {
             work.perform()
         } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
         }
     }
 }
 
 /// The view SwiftUI hosts. It owns pointer handling and reports its size to
-/// the controller; a backend-specific child does the drawing
-/// (`MpvMetalView` or `MpvRenderView`). The iOS twin puts a UIKit
+/// the controller; an `MpvMetalView` child does the drawing. The iOS twin puts a UIKit
 /// `CAMetalLayer` view in the same slot under the same coordinator.
 ///
 /// Pointer events live on a transparent topmost subview rather than on the
@@ -247,32 +221,17 @@ public final class MpvMetalView: NSView {
 @MainActor
 public final class MpvHostView: NSView {
     public weak var coordinator: MpvSurface.Coordinator?
-    /// Immutable after init, so safe to read from the coordinator's setup
-    /// path without a hop.
-    public nonisolated let backend: MpvRenderBackend
-    /// Present for `.openGL` only.
-    public private(set) var glView: MpvRenderView?
-    /// Present for `.metal` only.
     public private(set) var metalView: MpvMetalView?
     private let eventCatcher = MpvEventCatcherView(frame: .zero)
 
-    public init(frame frameRect: NSRect, backend: MpvRenderBackend) {
-        self.backend = backend
+    public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        switch backend {
-        case .openGL:
-            let gl = MpvRenderView(frame: bounds)
-            gl.autoresizingMask = [.width, .height]
-            addSubview(gl)
-            glView = gl
-        case .metal:
-            let metal = MpvMetalView(frame: bounds)
-            metal.autoresizingMask = [.width, .height]
-            addSubview(metal)
-            metalView = metal
-        }
+        let metal = MpvMetalView(frame: bounds)
+        metal.autoresizingMask = [.width, .height]
+        addSubview(metal)
+        metalView = metal
         eventCatcher.frame = bounds
         eventCatcher.autoresizingMask = [.width, .height]
         addSubview(eventCatcher)
@@ -298,7 +257,6 @@ public final class MpvHostView: NSView {
         guard window != nil else { return }
         window?.acceptsMouseMovedEvents = true
         eventCatcher.coordinator = coordinator
-        glView?.coordinator = coordinator
         coordinator?.attachMpv(to: self)
         reportContainerSize()
     }
@@ -371,295 +329,6 @@ final class MpvEventCatcherView: NSView {
     }
 }
 
-/// Renders mpv via libmpv's render API (`mpv_render_context`) into our own
-/// `NSOpenGLView`, instead of handing mpv a `wid` and letting its cocoa-cb
-/// backend own a real Cocoa window.
-///
-/// The `wid` approach (previous implementation) always spawns mpv's own
-/// auxiliary NSWindow internally — embedding is done by mpv reparenting that
-/// window's content view into ours after the fact, which is exactly the
-/// "stray window" mpv's own docs warn about: "using the render API is
-/// recommended, because window embedding can cause various issues" (render.h).
-/// It's also the direct cause of every symptom hit in practice: the window
-/// briefly visible in the wrong place before capture, its content view's
-/// stale frame leaving the video pillarboxed, and cocoa-cb swapping the Dock
-/// tile to mpv's own logo the moment its vo/window is created.
-///
-/// The render API has no window at all — mpv draws into an FBO we own on
-/// demand, so none of that exists by construction. `OpenGL` (not Metal) is
-/// used because it's the only accelerated backend `render.h`/`render_gl.h`
-/// expose on macOS (`MPV_RENDER_API_TYPE_OPENGL` — there is no
-/// `MPV_RENDER_API_TYPE_METAL` in libmpv's public API); this is the same
-/// mechanism mpv's own macOS docs describe for hardware decoding via CGL, and
-/// what embedders predating cocoa-cb (and IINA's advanced/embedded mode) use.
-@MainActor
-public final class MpvRenderView: NSOpenGLView {
-    public weak var coordinator: MpvSurface.Coordinator?
-
-    public override init(frame frameRect: NSRect) {
-        let attrs: [NSOpenGLPixelFormatAttribute] = [
-            UInt32(NSOpenGLPFAAccelerated),
-            UInt32(NSOpenGLPFADoubleBuffer),
-            UInt32(NSOpenGLPFAColorSize), 32,
-            UInt32(NSOpenGLPFAOpenGLProfile), UInt32(NSOpenGLProfileVersion3_2Core),
-            0
-        ]
-        guard let pixelFormat = NSOpenGLPixelFormat(attributes: attrs) else {
-            fatalError("[libmpv] No OpenGL 3.2 core pixel format available")
-        }
-        // NSOpenGLView's real designated initializer is init(frame:pixelFormat:);
-        // delegating to it (rather than the plain init(frame:) this override
-        // shadows) is how every NSOpenGLView subclass picks its pixel format.
-        super.init(frame: frameRect, pixelFormat: pixelFormat)!
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
-        wantsBestResolutionOpenGLSurface = true
-        // Vsync on the swap. `flushBuffer` runs on the render thread (see
-        // `MpvRenderTarget`), so the block it implies paces that thread to
-        // the display and costs the main thread nothing. mpv gets the swap
-        // time through `report_swap` and schedules the next frame off it.
-        openGLContext?.setValues([1], for: .swapInterval)
-    }
-
-    /// The backing-pixel size mpv renders at, pushed to the render thread
-    /// whenever it changes. Computed here because `convertToBacking` and
-    /// `bounds` are main-thread properties the render thread must not read.
-    private func publishDrawableSize() {
-        let px = convertToBacking(bounds).size
-        coordinator?.renderTarget?.setPixelSize(width: Int32(px.width), height: Int32(px.height))
-    }
-
-    public required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not used — MpvRenderView is always constructed programmatically")
-    }
-
-    public override func reshape() {
-        super.reshape()
-        // `update()` touches the drawable while the render thread may be
-        // mid-frame on the same context; CGL's context lock is the one
-        // serialization AppKit documents for a multithreaded NSOpenGLView.
-        if let context = openGLContext {
-            CGLLockContext(context.cglContextObj!)
-            context.update()
-            CGLUnlockContext(context.cglContextObj!)
-        }
-        reportContainerSize()
-        publishDrawableSize()
-        needsDisplay = true
-    }
-
-    public override func viewDidChangeBackingProperties() {
-        super.viewDidChangeBackingProperties()
-        publishDrawableSize()
-    }
-
-    public override func layout() {
-        super.layout()
-        reportContainerSize()
-        publishDrawableSize()
-    }
-
-    /// The chrome bars need to know exactly how large the video's own
-    /// letterboxed rect is, and doing that math against a second, separate
-    /// SwiftUI `GeometryReader` measurement invited a mismatch: this view's
-    /// `.ignoresSafeArea()` lets it bleed to the window's true edges in a
-    /// way a sibling `GeometryReader` reading the same hierarchy isn't
-    /// guaranteed to agree with (sidebar-claimed HStack space, safe-area
-    /// nesting) — the bars fit against a *different* rect than the one the
-    /// video actually rendered into. Reporting this view's own real `bounds`
-    /// (the same value `draw(_:)` already trusts for `renderFrame`) removes
-    /// the second source of truth entirely.
-    private func reportContainerSize() {
-        coordinator?.controller.videoContainerSize = bounds.size
-    }
-
-    /// Video is not drawn here. Frames are rendered by `MpvRenderTarget` on
-    /// its own thread, driven by mpv's update callback. Doing it here made
-    /// every frame wait for the main run loop and every SwiftUI layout pass
-    /// wait for the frame: `needsDisplay` coalesced 24fps content to
-    /// AppKit's display cycle, `mpv_render_context_render` blocked the main
-    /// thread until the frame's target time, and the FPS HUD counted the
-    /// result as main-thread stalls during playback. AppKit still calls this
-    /// on resize and first appearance, so it clears to black while no render
-    /// context exists (the surface is undefined before the first frame) and
-    /// otherwise asks the render thread to repaint the last frame at the new
-    /// size.
-    public override func draw(_ dirtyRect: NSRect) {
-        guard let context = openGLContext else { return }
-        if let target = coordinator?.renderTarget {
-            target.requestRedraw()
-            return
-        }
-        CGLLockContext(context.cglContextObj!)
-        context.makeCurrentContext()
-        glClearColor(0, 0, 0, 1)
-        glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
-        context.flushBuffer()
-        CGLUnlockContext(context.cglContextObj!)
-    }
-}
-
-/// Owns everything that touches `mpv_render_context`: a serial queue whose
-/// single thread is the only one that ever calls create, update, render or
-/// free, the `NSOpenGLContext` it makes current there, and the drawable's
-/// pixel size as last published by the view on the main thread.
-///
-/// render.h's contract is that the OpenGL context is current on whichever
-/// thread makes a render-context call and that, with `advanced_control` on,
-/// `mpv_render_context_update` is called for every update callback. Keeping
-/// all of it on one queue satisfies both without a lock around each call,
-/// and `advanced_control` in turn lets mpv render videotoolbox frames
-/// directly into GL textures instead of copying them.
-///
-/// The update callback (which mpv fires from its own threads) only enqueues;
-/// the closure retains this object, so a callback that lands after the
-/// coordinator has let go still has something valid to run against and
-/// finds `renderCtx` nil once `destroy()` has run ahead of it on the same
-/// serial queue.
-public final class MpvRenderTarget: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "app.anicat.mpv.render", qos: .userInteractive)
-    private let glContext: NSOpenGLContext
-    /// Queue-confined after `create`.
-    private var renderCtx: OpaquePointer?
-    private let sizeLock = NSLock()
-    private var pixelWidth: Int32 = 0
-    private var pixelHeight: Int32 = 0
-
-    init(glContext: NSOpenGLContext) {
-        self.glContext = glContext
-    }
-
-    var isCreated: Bool { queue.sync { renderCtx != nil } }
-
-    /// Creates the render context on the render thread. Blocks the caller
-    /// (setup, on the main thread) for the one-time creation only.
-    func create(mpv: OpaquePointer) -> Int32 {
-        queue.sync {
-            CGLLockContext(glContext.cglContextObj!)
-            defer { CGLUnlockContext(glContext.cglContextObj!) }
-            glContext.makeCurrentContext()
-
-            var glInitParams = mpv_opengl_init_params(
-                get_proc_address: { _, name in
-                    guard let name else { return nil }
-                    // render_gl.h: "macOS: CGL is required
-                    // (CGLGetCurrentContext() returning non-NULL)". The
-                    // OpenGL framework's symbols are already loaded into the
-                    // process by NSOpenGLContext, so dlsym against the
-                    // global namespace resolves them without linking CGL.
-                    return dlsym(UnsafeMutableRawPointer(bitPattern: -2), name)
-                },
-                get_proc_address_ctx: nil
-            )
-            var advanced: CInt = 1
-            let apiType = strdup(MPV_RENDER_API_TYPE_OPENGL)
-            defer { free(apiType) }
-
-            var status: Int32 = -1
-            withUnsafeMutablePointer(to: &glInitParams) { initPtr in
-                withUnsafeMutablePointer(to: &advanced) { advPtr in
-                    var params: [mpv_render_param] = [
-                        mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE, data: apiType),
-                        mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: UnsafeMutableRawPointer(initPtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL, data: UnsafeMutableRawPointer(advPtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil)
-                    ]
-                    status = mpv_render_context_create(&renderCtx, mpv, &params)
-                }
-            }
-            guard status >= 0, let renderCtx else {
-                self.renderCtx = nil
-                return status
-            }
-            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-            mpv_render_context_set_update_callback(renderCtx, { ctx in
-                guard let ctx else { return }
-                // Retained across the hop: see the type's doc comment.
-                let target = Unmanaged<MpvRenderTarget>.fromOpaque(ctx).takeUnretainedValue()
-                target.queue.async { target.handleUpdate() }
-            }, selfPtr)
-            return status
-        }
-    }
-
-    /// Main thread. Stores the size for the render thread and repaints the
-    /// current frame at it, so a live resize tracks the window instead of
-    /// waiting for the next decoded frame.
-    func setPixelSize(width: Int32, height: Int32) {
-        sizeLock.lock()
-        let changed = width != pixelWidth || height != pixelHeight
-        pixelWidth = width
-        pixelHeight = height
-        sizeLock.unlock()
-        if changed { requestRedraw() }
-    }
-
-    func requestRedraw() {
-        queue.async { self.render() }
-    }
-
-    /// One update callback's worth of work. `mpv_render_context_update`
-    /// must be called once per callback with `advanced_control` on, whether
-    /// or not a frame follows.
-    private func handleUpdate() {
-        guard let renderCtx else { return }
-        let flags = mpv_render_context_update(renderCtx)
-        if flags & UInt64(MPV_RENDER_UPDATE_FRAME.rawValue) != 0 {
-            render()
-        }
-    }
-
-    private func render() {
-        guard let renderCtx else { return }
-        sizeLock.lock()
-        let width = pixelWidth
-        let height = pixelHeight
-        sizeLock.unlock()
-        guard width > 0, height > 0 else { return }
-
-        CGLLockContext(glContext.cglContextObj!)
-        defer { CGLUnlockContext(glContext.cglContextObj!) }
-        glContext.makeCurrentContext()
-
-        var fbo = mpv_opengl_fbo(fbo: 0, w: width, h: height, internal_format: 0)
-        // The default framebuffer's origin is bottom-left; mpv's frames are
-        // top-left. Without this the picture renders upside down.
-        var flip: CInt = 1
-        withUnsafeMutablePointer(to: &fbo) { fboPtr in
-            withUnsafeMutablePointer(to: &flip) { flipPtr in
-                var params: [mpv_render_param] = [
-                    mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO, data: UnsafeMutableRawPointer(fboPtr)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y, data: UnsafeMutableRawPointer(flipPtr)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil)
-                ]
-                mpv_render_context_render(renderCtx, &params)
-            }
-        }
-        // Swap first, then report: `report_swap` is how mpv learns when the
-        // frame actually hit the display, and it was previously called
-        // before the swap so every timing sample it took was early by a
-        // vsync.
-        glContext.flushBuffer()
-        mpv_render_context_report_swap(renderCtx)
-    }
-
-    /// Frees the render context on the render thread with the GL context
-    /// current, as render.h requires, and detaches the update callback
-    /// first so mpv stops enqueueing. Blocks the caller; call it from the
-    /// teardown worker, never from the main thread, since a frame in flight
-    /// may be blocking on its target time.
-    func destroy() {
-        queue.sync {
-            guard let renderCtx else { return }
-            mpv_render_context_set_update_callback(renderCtx, nil, nil)
-            CGLLockContext(glContext.cglContextObj!)
-            glContext.makeCurrentContext()
-            mpv_render_context_free(renderCtx)
-            CGLUnlockContext(glContext.cglContextObj!)
-            self.renderCtx = nil
-        }
-    }
-}
 #else
 
 /// The iOS `.metal` child. UIKit has no layer-hosting concept, so the layer
@@ -719,14 +388,10 @@ public final class MpvMetalView: UIView {
 @MainActor
 public final class MpvHostView: UIView {
     public weak var coordinator: MpvSurface.Coordinator?
-    /// Immutable after init, so safe to read from the coordinator's setup
-    /// path without a hop.
-    public nonisolated let backend: MpvRenderBackend
     public private(set) var metalView: MpvMetalView?
     private let eventCatcher = MpvEventCatcherView(frame: .zero)
 
-    public init(frame: CGRect, backend: MpvRenderBackend) {
-        self.backend = backend
+    public override init(frame: CGRect) {
         super.init(frame: frame)
         isOpaque = true
         backgroundColor = .black
@@ -828,12 +493,9 @@ public struct MpvSurface {
     /// spellings — everything they actually do is the same.
     @MainActor
     fileprivate func makeHostView(coordinator: Coordinator) -> MpvHostView {
-        let view = MpvHostView(frame: .zero, backend: MpvRenderBackend.configured)
+        let view = MpvHostView(frame: .zero)
         view.coordinator = coordinator
         coordinator.hostView = view
-        #if os(macOS)
-        coordinator.renderView = view.glView
-        #endif
         coordinator.controller = controller
 
         if let streamURL {
@@ -849,9 +511,6 @@ public struct MpvSurface {
         view.coordinator = coordinator
         coordinator.hostView = view
         view.setCornerRadius(cornerRadius)
-        #if os(macOS)
-        coordinator.renderView = view.glView
-        #endif
         coordinator.controller = controller
 
         if view.window != nil && coordinator.mpvHandle == nil {
@@ -890,12 +549,6 @@ public struct MpvSurface {
             guard let mpv else { return nil }
             return body(mpv)
         }
-        #if os(macOS)
-        /// Everything render-context related lives here, on its own thread.
-        /// Set once in `setupMpv`, released by the teardown worker in `stop()`.
-        public private(set) var renderTarget: MpvRenderTarget?
-        fileprivate weak var renderView: MpvRenderView?
-        #endif
         private var isRunning = false
         fileprivate var controller: PlayerController
         fileprivate weak var hostView: MpvHostView?
@@ -959,15 +612,8 @@ public struct MpvSurface {
                 return
             }
 
-            switch view.backend {
-            #if os(macOS)
-            case .openGL:
-                // "libmpv" is the special vo name that opts into the render
-                // API instead of a normal window-owning vo — no "wid" is set.
-                mpv_set_option_string(handle, "vo", "libmpv")
-            #endif
-            case .metal:
-                // See MpvRenderBackend. `wid` is the CAMetalLayer pointer;
+            do {
+                // See `MpvMetalLayer`. `wid` is the CAMetalLayer pointer;
                 // MPVKit's moltenvk context bridges it back and creates the
                 // Vulkan surface on it. All of this must precede
                 // mpv_initialize, after which the vo already exists.
@@ -1077,37 +723,6 @@ public struct MpvSurface {
                 return
             }
 
-            #if os(macOS)
-            if view.backend == .openGL {
-                // `NSOpenGLContext` is explicitly non-Sendable, so the
-                // target that owns it is built inside the main-actor block
-                // rather than handing the context out of it.
-                let target = MainActor.assumeIsolated { () -> MpvRenderTarget? in
-                    view.glView?.openGLContext.map { MpvRenderTarget(glContext: $0) }
-                }
-                guard let target else {
-                    print("[libmpv] No OpenGL context on render view")
-                    mpv_destroy(handle)
-                    return
-                }
-
-                // Created on the render thread, which is the only thread
-                // that will ever touch it again.
-                let createStatus = target.create(mpv: handle)
-                if createStatus < 0 {
-                    print("[libmpv] Failed to create render context: \(createStatus)")
-                    mpv_destroy(handle)
-                    return
-                }
-                self.renderTarget = target
-                MainActor.assumeIsolated {
-                    if let gl = view.glView {
-                        let px = gl.convertToBacking(gl.bounds).size
-                        target.setPixelSize(width: Int32(px.width), height: Int32(px.height))
-                    }
-                }
-            }
-            #endif
 
             self.mpv = handle
             self.isRunning = true
@@ -1134,6 +749,12 @@ public struct MpvSurface {
                     Task { @MainActor in completion(tracks.audio, tracks.subtitle) }
                 }
             }
+            controller.onFetchMpvDetails = { [weak self] completion in
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let rows = self.flatMap { s in s.withHandle { _ in s.streamDetailRows() } } ?? []
+                    Task { @MainActor in completion(rows) }
+                }
+            }
             controller.onSelectAudioTrack = { [weak self] id in
                 self?.selectAudioTrack(id: id)
             }
@@ -1149,6 +770,12 @@ public struct MpvSurface {
             controller.onSetSpeed = { [weak self] rate in
                 self?.setSpeed(rate)
             }
+            controller.onSetVideoEnabled = { [weak self] enabled in
+                self?.setVideoEnabled(enabled)
+            }
+            controller.onSetSubtitleScale = { [weak self] scale in
+                self?.setSubtitleScale(scale)
+            }
             controller.onCycleSideways = { [weak self] in
                 self?.cycleSideways()
             }
@@ -1158,6 +785,20 @@ public struct MpvSurface {
             mpv_observe_property(handle, 3, "pause", MPV_FORMAT_FLAG)
             mpv_observe_property(handle, 4, "paused-for-cache", MPV_FORMAT_FLAG)
             mpv_observe_property(handle, 5, "cache-buffering-state", MPV_FORMAT_INT64)
+            // NONE: a notification only. The ranges are read back as
+            // sub-properties, the way the track list is, rather than by
+            // walking the MPV_FORMAT_NODE map.
+            mpv_observe_property(handle, 10, "demuxer-cache-state", MPV_FORMAT_NONE)
+            // The end of the file as mpv sees it, not as `duration` says.
+            // Every end-of-episode rule keys on `duration - time-pos`, and
+            // `duration` is not always the file's: a reopened episode asked
+            // AniSkip with 1407s for a 1380s file (anicat.log, 2026-09-11),
+            // and against 1407 the last tick sits 27s short of every mark,
+            // so neither the card nor auto-next ever fired. With keep-open
+            // this goes true on the last frame. It never fires on a torrent
+            // whose tail is not downloaded (CLAUDE.md), so it is a backstop
+            // for the position rules, not a replacement.
+            mpv_observe_property(handle, 11, "eof-reached", MPV_FORMAT_FLAG)
             // Displayed size — what the overlay chrome needs to know where
             // the letterboxed video rect actually sits, as opposed to the
             // window's own size.
@@ -1181,6 +822,7 @@ public struct MpvSurface {
             setVolume(controller.volume)
             setMuted(controller.isMuted)
             setSpeed(controller.playbackRate)
+            setSubtitleScale(PlayerController.subtitleScaleSetting)
 
             if let pending = pendingStreamURL {
                 loadFile(url: pending)
@@ -1209,7 +851,13 @@ public struct MpvSurface {
         /// Returns whether a detour went out now; false when there is no
         /// handle or the nudge was deferred behind one still held.
         @discardableResult
-        func nudgeVideoReconfig() -> Bool {
+        /// `reason` names the caller in the log line. A nudge is the one
+        /// thing in the player that makes mpv reconfigure the output
+        /// mid-stream, and a reconfig is a one-frame black; the owner
+        /// reported the picture "blinking" mid-episode and the log had no
+        /// line for the nudges the layout path sends, so it could not say
+        /// whether they were the cause. Rare enough to log always.
+        func nudgeVideoReconfig(reason: String = "size check") -> Bool {
             let debug = ProcessInfo.processInfo.environment["ANICAT_PLAYER_DEBUG"] != nil
             guard mpv != nil else {
                 if debug { PlayerLog.write("[nudge] skipped: no handle") }
@@ -1261,12 +909,18 @@ public struct MpvSurface {
             // vo at 3024x1898 in a 640x360 layer. Held up to 2s, the same
             // minimize reconfigured on the first nudge.
             nudgeTimeout = stringProperty("pause") == "yes" ? 2.0 : 0.25
-            if ProcessInfo.processInfo.environment["ANICAT_PLAYER_DEBUG"] != nil {
-                PlayerLog.write(String(format: "[nudge] override %@ -> %.6f, osd/w %@", current, detour, nudgeOSDBefore ?? "-"))
-            }
+            PlayerLog.write(String(format: "[nudge] %@: override %@ -> %.6f, osd/w %@, layer %.0fx%.0f, paused %@", reason, current, detour, nudgeOSDBefore ?? "-", lastDrawableSize.width, lastDrawableSize.height, stringProperty("pause") ?? "-"))
             runCommand(["set", "video-aspect-override", String(format: "%.6f", detour)])
             scheduleNudgeRestore(after: 0.03)
             return true
+        }
+
+        /// Presents the paused frame again: an exact seek to where playback
+        /// already is. mpv has no redraw command (`--input-cmdlist` on 0.41).
+        /// Caller holds `handleLock`.
+        private func refreshPausedFrame() {
+            guard let position = stringProperty("time-pos") else { return }
+            runCommand(["seek", position, "absolute+exact"])
         }
 
         private let nudgeLock = NSLock()
@@ -1312,11 +966,21 @@ public struct MpvSurface {
                     PlayerLog.write(String(format: "[nudge] restore to %@ after %.2fs, reconfigured %@%@", original, waited, reconfigured ? "yes" : "no", again ? ", running the deferred one" : ""))
                 }
                 self.runCommand(["set", "video-aspect-override", original])
+                // Paused, the reconfigure resized the swapchain and nothing
+                // drew into it again: back from the mini-player the log had
+                // "vo is 2598x1623, layer is 3024x1898; forcing a reconfig",
+                // the size check passed after it, and the paused frame stayed
+                // at 86% in the top-left of the window. An exact seek to
+                // where playback already is decodes and presents that frame
+                // at the new size without moving the position.
+                if !again, self.stringProperty("pause") == "yes" {
+                    self.refreshPausedFrame()
+                }
                 if again {
                     // Off this block: `nudgeVideoReconfig` reads properties
                     // through the handle lock this closure is still holding.
                     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.03) { [weak self] in
-                        self?.nudgeVideoReconfig()
+                        self?.nudgeVideoReconfig(reason: "deferred")
                     }
                 }
             }
@@ -1329,12 +993,10 @@ public struct MpvSurface {
         private var reconfigAttemptsForSize = 0
 
         func drawableSizeChanged(to size: CGSize) {
-            if ProcessInfo.processInfo.environment["ANICAT_PLAYER_DEBUG"] != nil {
-                PlayerLog.write(String(format: "[nudge] drawable now %.0fx%.0f", size.width, size.height))
-            }
+            PlayerLog.write(String(format: "[nudge] drawable now %.0fx%.0f (was %.0fx%.0f)", size.width, size.height, lastDrawableSize.width, lastDrawableSize.height))
             lastDrawableSize = size
             reconfigAttemptsForSize = 0
-            nudgeVideoReconfig()
+            nudgeVideoReconfig(reason: "drawable changed")
             // And once more after the size has held still. A nudge only
             // reconfigures when a frame next passes through mpv's filters,
             // and `verifyVideoSizeIfDue` cannot catch a nudge that did
@@ -1343,7 +1005,7 @@ public struct MpvSurface {
             // one that did not, so the check matched while the swapchain
             // stayed small.
             settleNudge?.cancel()
-            let settle = DispatchWorkItem { [weak self] in self?.nudgeVideoReconfig() }
+            let settle = DispatchWorkItem { [weak self] in self?.nudgeVideoReconfig(reason: "drawable settled") }
             settleNudge = settle
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: settle)
         }
@@ -1365,7 +1027,7 @@ public struct MpvSurface {
             let size = layer?.drawableSize ?? .zero
             if size.width > 1 { lastDrawableSize = size }
             reconfigAttemptsForSize = 0
-            nudgeVideoReconfig()
+            nudgeVideoReconfig(reason: "fullscreen ended")
             for delay in [0.3, 1.2] {
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak layer] in
                     guard let self else { return }
@@ -1416,7 +1078,7 @@ public struct MpvSurface {
                 // while one is still held only defers, and counting those is
                 // how the paused fullscreen restore ran out of attempts with
                 // the vo still at 640x360 in a 3024x1898 layer.
-                guard nudgeVideoReconfig() else { return }
+                guard nudgeVideoReconfig(reason: force ? "forced size check" : "idle size check") else { return }
                 reconfigAttemptsForSize += 1
                 PlayerLog.write(String(format: "[libmpv] vo is %.0fx%.0f, layer is %.0fx%.0f; forcing a reconfig (%d)", w, h, wanted.width, wanted.height, reconfigAttemptsForSize))
             }
@@ -1463,6 +1125,10 @@ public struct MpvSurface {
             // let the first time-pos update (proof a frame decoded) clear it.
             controller.isBuffering = true
             controller.bufferingPercent = nil
+            // The outgoing file's cache map drawn over the new file's
+            // timeline is the wrong bar for a beat; both sources refill.
+            controller.mpvBufferedRanges = []
+            controller.torrentBufferedFractions = []
             if controller.currentTime > 0 {
                 let startSec = String(format: "%.2f", controller.currentTime)
                 mpv_set_property_string(mpv, "start", startSec)
@@ -1510,6 +1176,15 @@ public struct MpvSurface {
             guard let mpv = mpv else { return }
             var value = rate
             mpv_set_property(mpv, "speed", MPV_FORMAT_DOUBLE, &value)
+        }
+
+        /// `sub-scale`, which mpv applies to ASS as well under the default
+        /// `sub-ass-override=yes`. Scale only, no colour or border: those
+        /// need `force`, which throws away the release's typesetting.
+        func setSubtitleScale(_ scale: Double) {
+            guard let mpv = mpv else { return }
+            var value = scale
+            mpv_set_property(mpv, "sub-scale", MPV_FORMAT_DOUBLE, &value)
         }
 
         /// Cycles off / 90 CW / 90 CCW, same three states and same reasoning
@@ -1742,6 +1417,20 @@ public struct MpvSurface {
             mpv_set_property_string(mpv, "aid", id)
         }
 
+        /// `vid=no` stops the decoder and the vo without touching the audio
+        /// pipeline; `auto` picks the file's default video track back up.
+        /// Off the main thread like the track walks: `vid` on a 1080p
+        /// H.264 stream blocks for the decoder teardown, and this is called
+        /// from the background transition where the main thread has a few
+        /// seconds before iOS snapshots and suspends.
+        func setVideoEnabled(_ enabled: Bool) {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                _ = self?.withHandle { mpv in
+                    mpv_set_property_string(mpv, "vid", enabled ? "auto" : "no")
+                }
+            }
+        }
+
         /// `nil` is the Off row. The id is remembered so a later Sub/Dub
         /// toggle re-applies it instead of overruling a choice the viewer
         /// made by hand — see `PlayerTrack.preferredSubtitle`.
@@ -1755,6 +1444,61 @@ public struct MpvSurface {
         /// One mpv string property, or `nil` when it is unset — mpv returns
         /// an empty string for a track with no language tag, and every
         /// caller here wants that to read as "absent".
+        /// When `demuxer-cache-state` was last read back; see the observer.
+        var lastCacheStateRead: CFTimeInterval = 0
+
+        /// mpv's `demuxer-cache-state/seekable-ranges` as spans in seconds.
+        func cachedSeekableRanges() -> [BufferedSpan] {
+            guard let countString = stringProperty("demuxer-cache-state/seekable-ranges/count"),
+                  let count = Int(countString), count > 0 else { return [] }
+            return (0..<count).compactMap { index in
+                guard let start = stringProperty("demuxer-cache-state/seekable-ranges/\(index)/start").flatMap(Double.init),
+                      let end = stringProperty("demuxer-cache-state/seekable-ranges/\(index)/end").flatMap(Double.init),
+                      end > start else { return nil }
+                return BufferedSpan(start: start, end: end)
+            }
+        }
+
+        /// What mpv itself knows about the stream, as panel rows. Called
+        /// inside `withHandle`, off the main thread.
+        func streamDetailRows() -> [StreamDetailRow] {
+            func prop(_ name: String) -> String? { stringProperty(name) }
+            var rows: [StreamDetailRow] = []
+            let codec = prop("video-codec") ?? prop("video-format")
+            let w = prop("video-params/w"), h = prop("video-params/h")
+            let size = (w != nil && h != nil) ? "\(w!)x\(h!)" : nil
+            let fps = prop("container-fps").flatMap(Double.init).map { String(format: "%.3f fps", $0) }
+            rows.append(StreamDetailRow("Video", [codec, size, fps].compactMap { $0 }.joined(separator: ", ")))
+            if let out = prop("video-out-params/dw"), let outH = prop("video-out-params/dh") {
+                rows.append(StreamDetailRow("Displayed", "\(out)x\(outH)"))
+            }
+            rows.append(StreamDetailRow("Decoder", prop("hwdec-current").map { $0 == "no" ? "software" : $0 } ?? "software"))
+            if let pix = prop("video-params/pixelformat") {
+                rows.append(StreamDetailRow("Pixel format", [pix, prop("video-params/colormatrix"), prop("video-params/primaries")].compactMap { $0 }.joined(separator: ", ")))
+            }
+            let audio = [prop("audio-codec-name"), prop("audio-params/hr-channels"), prop("audio-params/samplerate").map { "\($0) Hz" }]
+                .compactMap { $0 }.joined(separator: ", ")
+            if !audio.isEmpty { rows.append(StreamDetailRow("Audio", audio)) }
+            let vbr = prop("video-bitrate").flatMap(Double.init).map { String(format: "%.1f Mbps video", $0 / 1_000_000) }
+            let abr = prop("audio-bitrate").flatMap(Double.init).map { String(format: "%.0f kbps audio", $0 / 1000) }
+            let bitrate = [vbr, abr].compactMap { $0 }.joined(separator: ", ")
+            if !bitrate.isEmpty { rows.append(StreamDetailRow("Bitrate", bitrate)) }
+            if let cached = prop("demuxer-cache-duration").flatMap(Double.init) {
+                rows.append(StreamDetailRow("Read ahead", String(format: "%.1fs", cached)))
+            }
+            let drops = [prop("frame-drop-count").map { "\($0) vo" }, prop("decoder-frame-drop-count").map { "\($0) decoder" }]
+                .compactMap { $0 }.joined(separator: ", ")
+            if !drops.isEmpty { rows.append(StreamDetailRow("Dropped frames", drops)) }
+            if let vf = prop("vf"), !vf.isEmpty { rows.append(StreamDetailRow("Filters", vf)) }
+            if let shaders = prop("glsl-shaders"), !shaders.isEmpty {
+                let count = shaders.split(separator: ":").count
+                rows.append(StreamDetailRow("Shaders", "\(count) loaded"))
+            }
+            rows.append(StreamDetailRow("Container", [prop("file-format"), prop("file-size").flatMap(Double.init).map { String(format: "%.0f MB", $0 / 1_048_576) }].compactMap { $0 }.joined(separator: ", ")))
+            rows.append(StreamDetailRow("Source", prop("path") ?? "none"))
+            return rows
+        }
+
         func stringProperty(_ name: String) -> String? {
             guard let mpv else { return nil }
             guard let cstr = mpv_get_property_string(mpv, name) else { return nil }
@@ -1770,7 +1514,7 @@ public struct MpvSurface {
         /// slow screenshot would be the player's own fault.
         /// True once the drawable-side sampler is installed; the
         /// `screenshot-raw` path below then stays idle and only serves the
-        /// OpenGL escape hatch.
+        /// iOS Simulator, whose drawables have no presented handler.
         nonisolated(unsafe) var usesMetalAmbientSampler = false
 
         func sampleAmbientIfDue() async {
@@ -1792,7 +1536,7 @@ public struct MpvSurface {
             // Same bar detection the Metal sampler does, so the escape
             // hatch does not quietly lose the encoded-letterbox case that
             // `AmbientContentInset` exists for.
-            let inset = AmbientGlow.contentInset(of: frame) ?? .zero
+            let inset = AmbientGlow.centredBars(AmbientGlow.contentInset(of: frame) ?? .zero)
             let crop = inset.apply(to: CGRect(x: 0, y: 0, width: frame.width, height: frame.height))
             let cropped = crop.width >= 1 && crop.height >= 1 ? (frame.cropping(to: crop) ?? frame) : frame
             await MainActor.run {
@@ -1975,6 +1719,28 @@ public struct MpvSurface {
                         break
                     }
 
+                    if ev.event_id == MPV_EVENT_VIDEO_RECONFIG {
+                        PlayerLog.write(String(format: "[libmpv] video reconfig: out %@x%@ osd %@x%@ time-pos %@", self.stringProperty("video-out-params/dw") ?? "-", self.stringProperty("video-out-params/dh") ?? "-", self.stringProperty("osd-dimensions/w") ?? "-", self.stringProperty("osd-dimensions/h") ?? "-", self.stringProperty("time-pos") ?? "-"))
+                        // Read here as well as from the property observer.
+                        // `resolveAndPlay` clears the displayed size for every
+                        // episode, and mpv only reports `video-out-params`
+                        // when the value changes: a sideways episode after a
+                        // sideways episode came out 1080x1920 both times, no
+                        // report arrived, and the chrome fell back to the
+                        // decoder's unrotated 16:9 and laid its opaque bars
+                        // over the top and bottom of the turned picture.
+                        let w = self.stringProperty("video-out-params/dw").flatMap(Double.init) ?? 0
+                        let h = self.stringProperty("video-out-params/dh").flatMap(Double.init) ?? 0
+                        if w > 0, h > 0 {
+                            await MainActor.run {
+                                guard self.controller.videoDisplayWidth != w || self.controller.videoDisplayHeight != h else { return }
+                                self.controller.videoDisplayWidth = w
+                                self.controller.videoDisplayHeight = h
+                            }
+                        }
+                        continue
+                    }
+
                     if ev.event_id == MPV_EVENT_FILE_LOADED {
                         self.reconfigAttemptsForSize = 0
                         self.verifyVideoSizeIfDue(force: true)
@@ -2020,10 +1786,29 @@ public struct MpvSurface {
                                 }
                                 self.controller.isBuffering = false
                             }
+                        } else if name == "eof-reached", let data = prop.data {
+                            let reached = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                            guard reached else { continue }
+                            await MainActor.run {
+                                guard !self.controller.awaitingNewFile else { return }
+                                self.controller.handleEndOfFile()
+                            }
                         } else if name == "paused-for-cache", let data = prop.data {
                             let buffering = data.assumingMemoryBound(to: Int32.self).pointee != 0
                             await MainActor.run {
                                 self.controller.isBuffering = buffering
+                            }
+                        } else if name == "demuxer-cache-state" {
+                            // mpv fires this on every cache write, tens of
+                            // times a second while a swarm delivers; the bar
+                            // cannot show a difference finer than this.
+                            let now = CACurrentMediaTime()
+                            if now - self.lastCacheStateRead >= 0.5 {
+                                self.lastCacheStateRead = now
+                                let ranges = self.cachedSeekableRanges()
+                                await MainActor.run {
+                                    self.controller.mpvBufferedRanges = ranges
+                                }
                             }
                         } else if name == "cache-buffering-state", let data = prop.data {
                             let percent = Int(data.assumingMemoryBound(to: Int64.self).pointee)
@@ -2084,11 +1869,14 @@ public struct MpvSurface {
             controller.onSetPause = nil
             controller.onSelectAudioLanguage = nil
             controller.onFetchTracks = nil
+            controller.onFetchMpvDetails = nil
             controller.onSelectAudioTrack = nil
             controller.onSelectSubtitleTrack = nil
             controller.onSetVolume = nil
             controller.onSetMuted = nil
             controller.onSetSpeed = nil
+            controller.onSetVideoEnabled = nil
+            controller.onSetSubtitleScale = nil
             controller.onCycleSideways = nil
             controller.sidewaysState = 0
             sidewaysSavedHwdec = nil
@@ -2097,6 +1885,8 @@ public struct MpvSurface {
             lastAnime4KState = nil
             controller.isBuffering = false
             controller.bufferingPercent = nil
+            controller.mpvBufferedRanges = []
+            controller.torrentBufferedFractions = []
             controller.onPlaybackStopped?()
 
             // The event-loop task (`startEventLoop`) polls `mpv` on its own
@@ -2123,15 +1913,10 @@ public struct MpvSurface {
             // task (see `startEventLoop`), except that closure gets away
             // without a box because its capture list is inferred, not a
             // plain `DispatchQueue.global().async` closure's stricter one.
-            // `MpvRenderTarget` needs no box; it is `@unchecked Sendable`.
             handleLock.lock()
             let handle = UnsafeSendableBox(self.mpv)
             self.mpv = nil
             handleLock.unlock()
-            #if os(macOS)
-            let renderTarget = self.renderTarget
-            self.renderTarget = nil
-            #endif
             // Plain GCD, not a Swift `Task`: `DispatchSemaphore.wait()` is a
             // real thread block, and Swift's concurrency checker refuses to
             // compile it inside an `async` closure (blocking a cooperative
@@ -2139,16 +1924,6 @@ public struct MpvSurface {
             // queue thread has no such rule.
             DispatchQueue.global(qos: .userInitiated).async {
                 eventLoopStopped.wait()
-                // render.h: "You must free the context with
-                // mpv_render_context_free() before the mpv core is
-                // destroyed." `destroy()` does that on the render thread with
-                // the GL context current there, so teardown no longer needs
-                // the main thread at all: the old `DispatchQueue.main.sync`
-                // hop here could land while the main thread was inside
-                // `reshape()` holding the same CGL lock.
-                #if os(macOS)
-                renderTarget?.destroy()
-                #endif
                 if let mpv = handle.value {
                     mpv_destroy(mpv)
                 }

@@ -12,21 +12,35 @@ import SwiftUI
 /// Every other row here is a key something on the phone actually reads.
 /// Deliberately absent, because nothing on iOS reads them: GPU upscaling
 /// (Anime4K never runs here), the keyboard backlight dimmer (a MacBook
-/// feature), Discord presence (unix-socket IPC, which the sandbox has no
-/// counterpart for), and the TMDB key (cinema is not in the phone's scope).
+/// feature) and Discord presence (unix-socket IPC, which the sandbox has
+/// no counterpart for).
+///
+/// Defaults are the Mac's, literal for literal. This screen once said
+/// `"Subbed"` and `autoSkip = false` where the Mac and onboarding say
+/// `"Subtitled"` and `true`; the readers compare against "Dubbed" only, so
+/// it worked, but a phone that had been through onboarding showed the
+/// picker on neither of its own tags and the skip switch off while intros
+/// were being skipped.
 struct PhoneSettingsView: View {
     @Bindable var model: AppModel
 
-    @AppStorage("anicat_sub_dub") private var subDub: String = "Subbed"
-    @AppStorage("anicat_autoskip") private var autoSkip: Bool = false
+    @AppStorage("anicat_sub_dub") private var subDub: String = "Subtitled"
+    @AppStorage("anicat_autoskip") private var autoSkip: Bool = true
     @AppStorage("anicat_autoplay_next") private var autoPlayNext: Bool = true
+    // `PlayerController.isNextEpisodeCardEnabled` owns the reader (default on).
+    @AppStorage("anicat_next_up_card") private var nextUpCard: Bool = true
+    @AppStorage(PlayerController.subtitleScaleKey) private var subtitleScale: Double = 1.0
     // `AppModel.isCellularWarningEnabled` owns the reader and the default;
     // `@AppStorage` needs a literal here, so the two must agree.
     @AppStorage("anicat_warn_on_cellular") private var warnOnCellular: Bool = true
     // `AppModel.isStreamFromMacEnabled` owns the reader and the default.
     @AppStorage("anicat_stream_from_mac") private var streamFromMac: Bool = true
     @AppStorage("anicat_time_format") private var timeFormat: String = "24-hour"
-    @AppStorage("anicat_notify_new_episodes") private var notifyNewEpisodes: Bool = false
+    // `SystemNotifications` owns the reader and the default (on).
+    @AppStorage("anicat_notify_new_episodes") private var notifyNewEpisodes: Bool = true
+    @AppStorage(FeedbackDefaults.hapticsKey) private var haptics: Bool = true
+    @AppStorage(FeedbackDefaults.soundsKey) private var sounds: Bool = false
+    @State private var copyFeedback: String?
     @AppStorage(TmdbCredential.userKeyDefaultsKey) private var tmdbKey: String = ""
 
     // The theme controls gate view *structure* on `skin.hasLight` and on
@@ -51,15 +65,24 @@ struct PhoneSettingsView: View {
             account
             playback
             appearance
+            feedback
             storage
             notifications
             cinema
+            logs
             Section("About") {
                 AcknowledgementsButton {
                     Text("Acknowledgements")
                 }
             }
         }
+        // On the Form, not on a field. This sat on the AniList token field,
+        // which only exists while signed out -- so for a signed-in viewer
+        // the TMDB key was written to defaults and never handed to the live
+        // engine, which reads it once at construction. The next launch
+        // picked it up, and nothing in between explained why the row did
+        // nothing.
+        .onChange(of: tmdbKey) { _, _ in AppModel.shared?.applyTmdbKey() }
         .scrollContentBackground(.hidden)
         .background(SumiTheme.background)
         .navigationTitle("Settings")
@@ -110,10 +133,6 @@ struct PhoneSettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.system(size: 13, design: .monospaced))
-                    // Handed to the live engine; it reads the key once at
-                    // construction, so without this the field did nothing
-                    // until the app was started again.
-                    .onChange(of: tmdbKey) { _, _ in AppModel.shared?.applyTmdbKey() }
 
                     // `PasteButton`, not a long press on the field and not a
                     // `UIPasteboard.general.string` read behind a plain
@@ -181,7 +200,7 @@ struct PhoneSettingsView: View {
     private var playback: some View {
         Section("Playback") {
             Picker("Audio", selection: $subDub) {
-                Text("Subbed").tag("Subbed")
+                Text("Subtitled").tag("Subtitled")
                 Text("Dubbed").tag("Dubbed")
             }
             // A dub preference is a preference, not a filter — the engine
@@ -194,6 +213,18 @@ struct PhoneSettingsView: View {
                 .font(.system(size: 11.5))
                 .foregroundStyle(SumiTheme.muted)
             Toggle("Play next episode", isOn: $autoPlayNext)
+            if autoPlayNext {
+                Toggle("Countdown card before it", isOn: $nextUpCard)
+            }
+            Picker("Subtitle size", selection: $subtitleScale) {
+                Text("Small").tag(0.8)
+                Text("Normal").tag(1.0)
+                Text("Large").tag(1.25)
+                Text("Huge").tag(1.5)
+            }
+            .onChange(of: subtitleScale) { _, scale in
+                AppModel.shared?.playerController.onSetSubtitleScale?(scale)
+            }
             Toggle("Warn on cellular", isOn: $warnOnCellular)
             Text("Asked before each episode you start off Wi-Fi. Personal hotspots count.")
                 .font(.system(size: 11.5))
@@ -337,6 +368,57 @@ struct PhoneSettingsView: View {
     private var notifications: some View {
         Section("Notifications") {
             Toggle("New episodes", isOn: $notifyNewEpisodes)
+        }
+    }
+
+    /// The haptics switch was Mac-only, which is backwards: the Mac has a
+    /// trackpad tick, the phone has the Taptic Engine and fires it on every
+    /// watched mark and every error with no way to say no.
+    @ViewBuilder
+    private var feedback: some View {
+        Section("Sound & Haptics") {
+            Toggle("Haptics", isOn: $haptics)
+            Toggle("Interface sounds", isOn: $sounds)
+        }
+    }
+
+    /// The Mac reveals the file in Finder. The phone has no Finder, but it
+    /// has the share sheet, which reaches Mail, Messages and Files -- every
+    /// way a log gets attached to a report.
+    @ViewBuilder
+    private var logs: some View {
+        Section("Logs") {
+            ShareLink(item: AppLog.fileURL) {
+                Label("Share Log File", systemImage: "doc.text")
+            }
+            Button {
+                let report = """
+                Anicat Version: \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")
+                Platform: \(Platform.osName) \(ProcessInfo.processInfo.operatingSystemVersionString)
+                Signed In: \(model.isSignedIn)
+                AniList Viewer: \(model.viewer?.name ?? "None")
+                Stream from Mac: \(streamFromMac ? "Enabled" : "Disabled")
+                Timestamp: \(Date())
+                """
+                Platform.copyToPasteboard(report)
+                withAnimation(.snappy) { copyFeedback = "Copied" }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    withAnimation(.snappy) { copyFeedback = nil }
+                }
+            } label: {
+                HStack {
+                    Label("Copy Debug Report", systemImage: "doc.on.doc")
+                    Spacer()
+                    if let copyFeedback {
+                        Text(copyFeedback)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(SumiTheme.muted)
+                    }
+                }
+            }
+            Text("The log holds the last three launches, engine and player lines included. Attach it to a bug report.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(SumiTheme.muted)
         }
     }
 }

@@ -94,6 +94,11 @@ public enum SumiTheme {
     /// the same 10% wash behind a progress bar or a shortcut chip.
     public static var foregroundWash: Color { foreground.opacity(0.10) }
 
+    /// The favourite heart. One colour on every skin: AniList's own
+    /// favourite is this pink, and a heart that changed hue with the accent
+    /// read as a second state rather than the same one.
+    public static let favourite = Color(hex: "#EC4899")
+
     // MARK: - Radius
     public static let radiusSm: CGFloat = 6
     public static let radiusMd: CGFloat = 10

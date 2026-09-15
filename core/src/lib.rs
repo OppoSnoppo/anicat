@@ -11,6 +11,7 @@ pub mod db;
 pub mod discord;
 pub mod media;
 pub mod reader;
+pub mod skip;
 pub mod torrent;
 
 mod ffi;

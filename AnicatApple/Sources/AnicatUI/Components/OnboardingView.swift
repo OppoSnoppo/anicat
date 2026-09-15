@@ -58,7 +58,12 @@ public struct OnboardingView: View {
             case .mode: return "Where to start"
             case .watching: return "How you watch"
             case .picture: return "Picture"
-            case .alerts: return "Alerts and presence"
+            case .alerts:
+                #if os(macOS)
+                return "Alerts and presence"
+                #else
+                return "Alerts"
+                #endif
             case .look: return "Look"
             }
         }
@@ -74,7 +79,11 @@ public struct OnboardingView: View {
             case .picture:
                 return "Both cost GPU time and both can be turned off at any point."
             case .alerts:
+                #if os(macOS)
                 return "Anicat tells you when something airs, and can show what you are watching."
+                #else
+                return "Anicat tells you when something on your list airs."
+                #endif
             case .look:
                 return "Applies immediately. There are more in Settings."
             }
@@ -95,10 +104,29 @@ public struct OnboardingView: View {
             switch step {
             case .mode: return model.cinemaAvailable
             case .connect: return model.appMode == .anime || model.isSignedIn
+            case .picture:
+                // Anime4K never runs on iOS and the glow is Mac-only, so
+                // the step would be two switches that change nothing.
+                #if os(iOS)
+                return false
+                #else
+                return true
+                #endif
             default: return true
             }
         }
     }
+
+    /// 48pt either side is a window margin. On a 402pt phone it left 306pt
+    /// for the token field and the theme swatches, which wrapped the
+    /// three-up theme row onto two lines.
+    #if os(iOS)
+    private static let horizontalInset: CGFloat = 20
+    private static let verticalInset: CGFloat = 12
+    #else
+    private static let horizontalInset: CGFloat = 48
+    private static let verticalInset: CGFloat = 36
+    #endif
 
     private var step: Step { steps.indices.contains(stepIndex) ? steps[stepIndex] : .watching }
     private var isLastStep: Bool { stepIndex >= steps.count - 1 }
@@ -126,8 +154,8 @@ public struct OnboardingView: View {
 
                 footer
             }
-            .padding(.horizontal, 48)
-            .padding(.vertical, 36)
+            .padding(.horizontal, Self.horizontalInset)
+            .padding(.vertical, Self.verticalInset)
         }
         .onChange(of: model.isSignedIn) { _, signedIn in
             // Straight on rather than out: connecting is the first of five
@@ -380,7 +408,7 @@ public struct OnboardingView: View {
                 // Not "anime and manga": the same mode carries the light
                 // novels, and naming two of the three reads as a promise that
                 // the third lives somewhere else.
-                caption: "Anime covers series, manga and light novels from AniList. Cinema covers films and TV from TMDB. The mark at the foot of the sidebar switches between them at any time.",
+                caption: Self.modeCaption,
                 options: [AppModel.AppMode.anime.onboardingLabel, AppModel.AppMode.cinema.onboardingLabel],
                 selection: Binding(
                     get: { model.appMode.onboardingLabel },
@@ -480,7 +508,12 @@ public struct OnboardingView: View {
     private var alertsStep: some View {
         VStack(alignment: .leading, spacing: 16) {
             toggleRow("New episode alerts", "A notification when something on your watching list airs. Announced once.", $notifyNewEpisodes)
-            toggleRow("Discord presence", "Shows the title and episode you are on. Nothing else leaves the device.", $discordPresence)
+            // Discord's IPC is a unix socket; the iOS sandbox has no such
+            // thing, so the phone neither offers the switch nor draws the
+            // mock of what it would show.
+            #if os(macOS)
+            toggleRow("Discord presence", "Shows what you are watching or reading. Settings can hide the title.", $discordPresence)
+            #endif
 
             preview {
                 VStack(spacing: 8) {
@@ -488,11 +521,11 @@ public struct OnboardingView: View {
                         MockNotification()
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
-                    if discordPresence {
+                    if showsPresence {
                         MockPresence()
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
-                    if !notifyNewEpisodes, !discordPresence {
+                    if !notifyNewEpisodes, !showsPresence {
                         Text("Nothing is announced and nothing is shared.")
                             .font(.system(size: 11))
                             .foregroundColor(SumiTheme.muted)
@@ -503,6 +536,24 @@ public struct OnboardingView: View {
                 .animation(.smooth(duration: 0.25), value: discordPresence)
             }
         }
+    }
+
+    /// The switch lives in different places: the Mac's is the mark at the
+    /// foot of the sidebar, the phone's is the segment in every tab's header.
+    private static var modeCaption: String {
+        #if os(macOS)
+        return "Anime covers series, manga and light novels from AniList. Cinema covers films and TV from TMDB. The mark at the foot of the sidebar switches between them at any time."
+        #else
+        return "Anime covers series, manga and light novels from AniList. Cinema covers films and TV from TMDB. The segment at the top of every tab switches between them at any time."
+        #endif
+    }
+
+    private var showsPresence: Bool {
+        #if os(macOS)
+        return discordPresence
+        #else
+        return false
+        #endif
     }
 
     @ViewBuilder
@@ -766,19 +817,32 @@ private struct MockNotification: View {
 
 private struct MockPresence: View {
     var body: some View {
+        // Laid out like the real card (discord.rs): title, then "E3 · name",
+        // with the paw badge on the cover's corner. The cover is a plain
+        // indigo block, not art, so the preview promises no particular show.
         HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 6)
-                .fill(LinearGradient(colors: [Color(red: 0.35, green: 0.40, blue: 0.85),
-                                              Color(red: 0.55, green: 0.35, blue: 0.75)],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+                .fill(SumiTheme.indigo.opacity(0.35))
                 .frame(width: 34, height: 34)
+                .overlay(alignment: .bottomTrailing) {
+                    Image(systemName: "pawprint.fill")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(SumiTheme.indigo)
+                        .padding(3)
+                        .background(Circle().fill(SumiTheme.card))
+                        .offset(x: 4, y: 4)
+                }
             VStack(alignment: .leading, spacing: 2) {
                 Text("Watching Anicat")
                     .sumiTabularMono(size: 9, weight: .semibold)
                     .foregroundColor(SumiTheme.muted)
-                Text("An Archdemon's Dilemma - EP 10")
+                Text("Frieren")
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundColor(SumiTheme.foreground)
+                    .lineLimit(1)
+                Text("E3 · Killing Magic")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(SumiTheme.muted)
                     .lineLimit(1)
             }
             Spacer(minLength: 8)

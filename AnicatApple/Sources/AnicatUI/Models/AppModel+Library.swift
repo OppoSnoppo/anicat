@@ -319,7 +319,11 @@ extension AppModel {
                 guard let p = progress, let r = released else { return false }
                 return s.listStatus == "CURRENT" && p < r
             }(),
-            listEntryId: s.listEntryId
+            listEntryId: s.listEntryId,
+            format: s.format,
+            // `nextEpisode` is the only airing signal `MediaSummary`
+            // carries; see the comment above `released`.
+            isAiring: s.nextEpisode != nil
         )
     }
 
@@ -766,10 +770,12 @@ extension AppModel {
         // `async let` at the `refreshAll` level.
         async let trendingTask = engine.trending(mediaType: "ANIME", format: nil, limit: 24)
         async let watchingTask = engine.userList(status: "CURRENT", mediaType: "ANIME")
+        async let rewatchingTask = engine.userList(status: "REPEATING", mediaType: "ANIME")
         async let profileTask = engine.viewerProfile()
 
         let trending = (try? await trendingTask) ?? []
         var watching = (try? await watchingTask) ?? []
+        let rewatching = (try? await rewatchingTask) ?? []
         var profile = try? await profileTask
         if ScreenshotFixtures.isEnabled {
             watching = ScreenshotFixtures.watching(from: trending)
@@ -782,7 +788,11 @@ extension AppModel {
         isSignedIn = profile != nil
         viewer = profile
         watchingItems = watching.map(Self.card)
-        watchingSummaries = watching
+        // Rewatches join the queue, not the Watching shelf: they have a next
+        // episode to play like any current show, and were otherwise reachable
+        // only from Library > Rewatching.
+        let currentIds = Set(watching.map(\.catalogId))
+        watchingSummaries = watching + rewatching.filter { !currentIds.contains($0.catalogId) }
         rebuildUpNext()
 
         // Only shows AniList actually has an airing time for. A show with no
@@ -816,6 +826,37 @@ extension AppModel {
             )
         }
         scheduleItems = combinedAiring.sorted { $0.airingAt < $1.airingAt }
+        armScheduleRollover()
+    }
+
+    /// Refreshes once the earliest scheduled episode has aired. The schedule,
+    /// Up Next and every "not aired yet" episode are built from AniList's
+    /// `nextAiringEpisode` at fetch time, and nothing fetched them again
+    /// inside a session: an app left open since the night before still said
+    /// "EP 11 19:38" at 20:23, and episode 11 stayed unplayable until a
+    /// relaunch.
+    func armScheduleRollover() {
+        scheduleRolloverTask?.cancel()
+        let now = Date().timeIntervalSince1970
+        guard let next = scheduleItems.map(\.airingAt).first(where: { TimeInterval($0) > now - 3600 }) else { return }
+        // Two minutes past air time: AniList moves `nextAiringEpisode` on at
+        // the airing moment, and the list cache below it needs a beat. A time
+        // already in the past (AniList itself not rolled over yet) waits ten
+        // minutes rather than refreshing in a tight loop.
+        let untilAired = TimeInterval(next) - now
+        let delay = untilAired > 0 ? untilAired + 120 : 600
+        scheduleRolloverTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(delay, 1) * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            print("[schedule] episode airing at \(next) has aired, refreshing")
+            await self.refreshAll(showLoading: false)
+            // The open page too: its episode list is the one that says which
+            // episodes have aired, and it kept "Rewatch Episode 10" after 11
+            // aired because nothing re-read it.
+            if let open = self.selectedMediaDetails, !self.isDetailLoading {
+                await self.loadDetail(id: open.id, isManga: self.currentDetailIsManga(), forceRefresh: true)
+            }
+        }
     }
 
     /// "6h ago", "3d ago" — the same buckets `relativeDay` uses on the web.
@@ -846,7 +887,7 @@ extension AppModel {
         // happened to sit first in AniList's own list order, not whatever
         // was actually last touched.
         let sortedWatching = watchingSummaries.sorted { (touched($0) ?? 0) > (touched($1) ?? 0) }
-        upNextItems = sortedWatching.map { s in
+        let entries = sortedWatching.map { s in
             let progress = Int(s.progress ?? 0)
             let total = Int(s.episodes ?? 0)
             // Same fallback caveat as Self.card: nextEpisode is nil once a
@@ -854,6 +895,10 @@ extension AppModel {
             // status to tell finished apart from mid-season, so only trust
             // nextEpisode itself as the "new episode" signal.
             let released = s.nextEpisode.map { Int($0) - 1 } ?? -1
+            // Caught up with an airing show: the episode after the viewer's
+            // progress is the one AniList has not aired. The row said
+            // "EP 12 / 12" with Resume a day before episode 12 aired.
+            let awaiting = s.nextEpisode.map { progress + 1 >= Int($0) } ?? false
             return UpNextQueueView.QueueEntry(
                 id: s.catalogId,
                 title: s.title,
@@ -863,9 +908,16 @@ extension AppModel {
                 progressPercent: total > 0 ? Double(progress) / Double(total) * 100 : 0,
                 watchedTimeAgo: touched(s).map(Self.relativeTime),
                 hasNewEpisode: progress < released,
-                unit: "EP"
+                unit: "EP",
+                nextAiringAt: awaiting ? s.nextAiringAt : nil,
+                isRewatch: s.listStatus == "REPEATING",
+                bannerURL: DetailCache.peekBanner(id: s.catalogId, isManga: false)
             )
         }
+        // Something playable on top: the first row is the big Resume, and
+        // the menu bar and Shortcuts read `first` as "continue watching".
+        // Stable, so recency still orders each half.
+        upNextItems = entries.filter { !$0.isAwaitingEpisode } + entries.filter(\.isAwaitingEpisode)
     }
 
     /// SQLite's `datetime('now')`: `YYYY-MM-DD HH:MM:SS`, UTC, no zone marker.

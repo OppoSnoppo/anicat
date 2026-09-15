@@ -25,6 +25,9 @@ pub struct Candidate {
     /// episode before it will play one of these, so an untagged single-episode
     /// release can't be mistaken for a batch and played as the wrong episode.
     pub assume_batch: bool,
+    /// The AniDB anime AnimeTosho matched this torrent to, when the listing
+    /// came from AnimeTosho and it had one. See `verify`.
+    pub anidb_aid: Option<i64>,
 }
 
 /// Standard open trackers appended to infohash-only magnets so peers are
@@ -335,15 +338,30 @@ fn segment_matches(query_norm: &str, segment_norm: &str) -> bool {
     // sitting *before* the episode marker ("Monster" against "Monster Hunter
     // S01E06" still rejects on "hunter").
     if let Some(cut) = s.iter().position(|t| is_episode_marker(t)) {
-        if cut < q.len() {
-            return false;
-        }
         s.truncate(cut);
     }
-    if q.is_empty() || s.len() < q.len() || s[..q.len()] != q[..] {
+    // The title is compared with the spaces between its words taken out, and
+    // must end on a word boundary of the segment. A dash inside a romanized
+    // word splits it for `normalize`: Erai-raws writes "Tenkou-saki no Seiso",
+    // AniList "Tenkousaki no Seiso", and word-by-word the two never matched,
+    // so every Erai-raws release of that show was missing from the pool.
+    let wanted: String = q.concat();
+    if q.is_empty() {
         return false;
     }
-    let rest = &s[q.len()..];
+    let mut joined = String::new();
+    let mut title_len = None;
+    for (i, token) in s.iter().enumerate() {
+        joined.push_str(token);
+        if joined.len() >= wanted.len() {
+            if joined == wanted {
+                title_len = Some(i + 1);
+            }
+            break;
+        }
+    }
+    let Some(title_len) = title_len else { return false };
+    let rest = &s[title_len..];
     // A run of two or more numbers is an episode range ("Toradora 01 25") and
     // says nothing about which show this is. A *lone* trailing number is part
     // of the title — "Steins;Gate 0" is a different series from "Steins;Gate",
@@ -381,8 +399,11 @@ fn is_episode_marker(t: &str) -> bool {
 
 /// The (season, episode) pair in an "s01e06" token, if that is what this is.
 fn season_episode(t: &str) -> Option<(u32, u32)> {
-    let rest = t.strip_prefix('s')?;
-    let (season, episode) = rest.split_once('e')?;
+    // "01x36" states the season as plainly as "s01e36" does.
+    let (season, episode) = match t.strip_prefix('s') {
+        Some(rest) => rest.split_once('e')?,
+        None => t.split_once('x').filter(|(s, e)| s.len() <= 2 && e.len() <= 4)?,
+    };
     if season.is_empty() || episode.is_empty() {
         return None;
     }
@@ -548,18 +569,70 @@ pub(crate) fn names_a_sibling(name_norm: &str, titles: &[String], siblings: &[St
         format!(" {} ", name_norm).contains(&format!(" {} ", word))
     };
     let own: Vec<String> = titles.iter().flat_map(|t| content(t)).collect();
+    // Only a title of two words or more can vouch for a release. AniList
+    // lists "GGO" as a synonym of Sword Art Online II, a spin-off's release
+    // ends in "(GGO)", and that one word kept "Sword Art Online Alternative
+    // Gun Gale Online" as this entry's: episodes 2 to 4 played the wrong show.
+    let vouching: Vec<String> = titles
+        .iter()
+        .map(|t| content(t))
+        .filter(|words| words.len() >= 2)
+        .flatten()
+        .collect();
     for sibling in siblings {
         let sib = content(sibling);
         let sibling_only: Vec<&String> = sib.iter().filter(|w| !own.contains(w)).collect();
         if sibling_only.is_empty() || !sibling_only.iter().all(|w| has(w)) {
             continue;
         }
-        let ours_only: Vec<&String> = own.iter().filter(|w| !sib.contains(w)).collect();
+        let ours_only: Vec<&String> = vouching.iter().filter(|w| !sib.contains(w)).collect();
         if !ours_only.iter().any(|w| has(w)) {
             return true;
         }
     }
     false
+}
+
+/// Nyaa exclusion terms (" -Alternative -Ordinal") for the words that make
+/// each related entry that entry. Nyaa sorts by seeders and answers one page
+/// of 75: "Sword Art Online II 1080p" came back as 75 releases of the Gun
+/// Gale Online spin-off, the sibling check rightly threw every one away, and
+/// no Sword Art Online II release was left to play. With "-Alternative" the
+/// same query lists eleven of them.
+///
+/// One word per sibling, the first that is its own: the start of a subtitle is
+/// what names it, while later words ("Bullet", "Episode") are the kind this
+/// entry's own releases use too.
+pub(crate) fn sibling_exclusions(siblings: &SiblingTitles<'_>) -> String {
+    const GENERIC: &[&str] = &["edition", "episode", "the", "and", "chapter", "final", "complete"];
+    const MAX_TERMS: usize = 4;
+    let own: Vec<String> = siblings
+        .own
+        .iter()
+        .flat_map(|t| normalize(t).split(' ').map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    let mut terms: Vec<String> = vec![];
+    for sibling in siblings.related {
+        let word = normalize(sibling)
+            .split(' ')
+            .find(|w| {
+                w.len() >= 4
+                    && w.chars().all(|c| c.is_ascii_alphabetic())
+                    && !own.iter().any(|o| o == w)
+                    && !KIND_WORDS.contains(w)
+                    && !GENERIC.contains(w)
+            })
+            .map(str::to_string);
+        if let Some(word) = word {
+            if !terms.contains(&word) {
+                terms.push(word);
+            }
+        }
+        if terms.len() == MAX_TERMS {
+            break;
+        }
+    }
+    terms.iter().map(|t| format!(" -{}", t)).collect()
 }
 
 /// Does this release name an extra that isn't this one, judged from the name
@@ -846,6 +919,24 @@ fn parse_episode(name: &str) -> (Option<f64>, Option<(f64, f64)>) {
     }
     // "S01E05"
     if let Some(c) = regex_lite::Regex::new(r"[sS]\d{1,2}[eE](\d{1,4})").unwrap().captures(name) {
+        // "S23E01 (E1156)": long runners are cut into TVDB seasons that AniList
+        // does not have, and the absolute number beside it is the one AniList
+        // uses. Read as episode 1, that One Piece release was the best
+        // candidate for One Piece episode 1.
+        if let Some(abs) = regex_lite::Regex::new(r"[sS]\d{1,2}[eE]\d{1,4}\s*[(\[][eE][pP]?\s?(\d{1,4})[)\]]")
+            .unwrap()
+            .captures(name)
+        {
+            return (abs[1].parse().ok(), None);
+        }
+        return (c[1].parse().ok(), None);
+    }
+    // "01x36", the season-by-episode form of TV-style packs. Checked before
+    // the dash rule: "Death Note - 01x36 - 1.28.mkv" reads " - 01" as episode
+    // 1, every one of that pack's 37 files did, and the largest of them
+    // (episode 36) played for episode 1. The leading boundary keeps
+    // "1920x1080" out.
+    if let Some(c) = regex_lite::Regex::new(r"\b\d{1,2}[xX](\d{1,4})\b").unwrap().captures(name) {
         return (c[1].parse().ok(), None);
     }
     // "Title - 05", "Title - 05v2", "Title - 05.5"
@@ -996,6 +1087,10 @@ pub(crate) fn seeder_score(seeders: u64) -> i64 {
 
 /// Penalty for a film when a numbered series episode was requested.
 const FILM_MISMATCH_PENALTY: i64 = 300;
+/// Below every batch, so a series' own episodes always outrank a special
+/// that happens to share the number.
+const SPECIAL_MISMATCH_PENALTY: i64 = 800;
+const SPECIAL_WORDS: &[&str] = &["sp", "special", "specials", "ova", "ovas", "oad", "oads"];
 
 /// A 720p release scores this far below the equivalent 1080p one.
 ///
@@ -1132,9 +1227,10 @@ fn score_release(
     // For an extras entry only: the franchise's other entries share this
     // one's title, so a release of any of them matches it. See
     // `names_a_sibling`.
-    if extras
-        && (names_a_sibling(&name_norm, siblings.own, siblings.related)
-            || names_an_unrelated_extra(name, siblings.own))
+    // A spin-off or sequel carries this entry's title plus its own words, so
+    // it matches for a TV entry just as it does for an extra.
+    if names_a_sibling(&name_norm, siblings.own, siblings.related)
+        || (extras && names_an_unrelated_extra(name, siblings.own))
     {
         return None;
     }
@@ -1192,6 +1288,16 @@ fn score_release(
         || name_norm.contains(" film");
     if looks_like_film && !allow_episodeless && exact.is_none() {
         score -= FILM_MISMATCH_PENALTY;
+    }
+    // A numbered special of the same series ("One Piece - SP - Barto's Secret
+    // Room - 01") states the number asked for and matches the title, so it
+    // scored as a single-episode hit and was the best candidate for One
+    // Piece episode 1. Only a single numbered release: a batch named
+    // "S1 + OVA" holds the TV episodes too.
+    if !extras && exact.is_some() && !query_norm.split(' ').any(|t| SPECIAL_WORDS.contains(&t))
+        && name_norm.split(' ').any(|t| SPECIAL_WORDS.contains(&t))
+    {
+        score -= SPECIAL_MISMATCH_PENALTY;
     }
     if prefer_dub {
         if is_dub_release(&name_norm) {
@@ -1282,6 +1388,7 @@ async fn search_subsplease(
             if d.get("res").and_then(|v| v.as_str()) == Some("1080") {
                 if let Some(magnet) = d.get("magnet").and_then(|v| v.as_str()) {
                     out.push(Candidate {
+                        anidb_aid: None,
                         name: format!("[SubsPlease] {} - {} (1080p)", show, ep_str),
                         magnet: Some(magnet.to_string()),
                         torrent_url: None,
@@ -1457,6 +1564,7 @@ async fn search_animetosho(
             seeders,
             score,
             assume_batch,
+            anidb_aid: item.get("anidb_aid").and_then(|v| v.as_i64()),
         });
     }
     out
@@ -1547,6 +1655,7 @@ async fn search_nyaa(
             Some(magnet_from_infohash(&infohash))
         };
         out.push(Candidate {
+            anidb_aid: None,
             name,
             magnet,
             torrent_url: if torrent_url.is_empty() { None } else { Some(torrent_url) },
@@ -1707,7 +1816,7 @@ async fn search_pool(
         // named without it. Matching is unaffected either way: `norm` still
         // governs what counts as a hit, and normalize() already discards
         // punctuation.
-        let q_title = search_query_form(title);
+        let q_title = format!("{}{}", search_query_form(title), sibling_exclusions(siblings));
         rounds.push(vec![
             (format!("{} - {:02}", q_title, episode), norm.clone(), single),
             // Nyaa's search is an AND over terms, so the episode has to be
@@ -1720,8 +1829,21 @@ async fn search_pool(
                 norm.clone(),
                 single,
             ),
-            (format!("{} 1080p", q_title), norm, criteria),
+            (format!("{} 1080p", q_title), norm.clone(), criteria),
         ]);
+        // The title without its first word, searched but still matched as
+        // the whole title. Nyaa searches words literally, so a group that
+        // splits that word differently is invisible to the full title:
+        // "Tenkousaki no Seiso ... - 10" found no Erai-raws release, whose
+        // names say "Tenkou-saki", while the same query without its first
+        // word listed 21 of them. Only for a long title, where the words
+        // left are still specific to the one show.
+        let words: Vec<&str> = q_title.split_whitespace().collect();
+        if rounds.len() == 1 && words.len() >= 6 {
+            if let Some(round) = rounds.last_mut() {
+                round.push((format!("{} {:02}", words[1..].join(" "), episode), norm, single));
+            }
+        }
     }
     // Concurrent, but only so far. Measured against the live site, four
     // concurrent Nyaa requests all answer 200 while eight return two 429s and
@@ -2076,6 +2198,9 @@ fn merge_duplicates(candidates: Vec<Candidate>) -> Vec<Candidate> {
                 if kept.magnet.is_none() {
                     kept.magnet = c.magnet;
                 }
+                if kept.anidb_aid.is_none() {
+                    kept.anidb_aid = c.anidb_aid;
+                }
                 // Only one of the two listings needs to have named the episode
                 // for the pair to stop being a guess.
                 kept.assume_batch = kept.assume_batch && c.assume_batch;
@@ -2140,6 +2265,7 @@ mod tests {
 
     fn candidate(score: i64, seeders: u64, assume_batch: bool) -> Candidate {
         Candidate {
+            anidb_aid: None,
             name: "release".into(),
             magnet: None,
             torrent_url: None,
@@ -2252,6 +2378,7 @@ mod tests {
     #[test]
     fn one_release_listed_by_two_indexes_keeps_what_each_of_them_knew() {
         let from_tosho = Candidate {
+            anidb_aid: None,
             name: "[ASW] Some Show - 05 [1080p]".into(),
             magnet: Some("magnet:?xt=urn:btih:abc".into()),
             torrent_url: Some("https://storage.animetosho.org/torrent/abc.torrent".into()),
@@ -2264,6 +2391,7 @@ mod tests {
         // different swarm -- so a score-ordered dedupe would keep this one and
         // throw the `.torrent` URL away with the other.
         let from_nyaa = Candidate {
+            anidb_aid: None,
             name: "[ASW] Some Show - 05 [1080p]".into(),
             magnet: Some("magnet:?xt=urn:btih:abc".into()),
             torrent_url: None,
@@ -3125,5 +3253,60 @@ mod extras_tests {
         let qb = normalize("Shinmai Maou no Testament Burst Specials");
         assert!(score_release(BURST_SP, &qb, &[], &sib_b, crit(1, 5)).is_some(), "five-special entry");
         assert!(score_release(KUROMII, &qb, &[], &sib_b, crit(1, 5)).is_none(), "the other collection");
+    }
+
+    #[test]
+    fn an_absolute_number_beside_a_tvdb_season_is_the_episode() {
+        assert_eq!(filename_episode("[AK4NE] One Piece - S23E01 (E1156) (WEB-Enc 1080p AV1 OPUS) [9DC89D53]"), Some(1156));
+        assert_eq!(filename_episode("[EMBER] Some Show S01E05 (1080p) [Dual Audio]"), Some(5));
+    }
+
+    #[test]
+    fn a_numbered_special_is_not_the_series_episode() {
+        let q = normalize("ONE PIECE");
+        let sib = SiblingTitles { own: &[], related: &[] };
+        let special = score_release("[Judas] One Piece - SP - Barto`s Secret Room - 01 [1080p][HEVC x265 10bit][Multi-Subs] (Weekly)", &q, &[], &sib, ReleaseCriteria { episode: 1, allow_episodeless: false, prefer_dub: false, browser_client: false, extras: false, episode_count: None, aired_episodes: None }).unwrap().0;
+        let batch = score_release("[Anime Time] One Piece (Season 01) East Blue (Fixed) [1080p][HEVC 10bit x265][AAC] [Dual Audio][Eng Sub]", &q, &[], &sib, ReleaseCriteria { episode: 1, allow_episodeless: false, prefer_dub: false, browser_client: false, extras: false, episode_count: None, aired_episodes: None }).unwrap().0;
+        assert!(special < batch, "special {} batch {}", special, batch);
+    }
+
+    #[test]
+    fn a_spin_off_is_not_the_series_a_short_synonym_shares() {
+        let own: Vec<String> = vec!["Sword Art Online II".into(), "SAO2".into(), "GGO".into()];
+        let related: Vec<String> = vec![
+            "Sword Art Online".into(),
+            "Sword Art Online: Ordinal Scale".into(),
+            "Sword Art Online Alternative: Gun Gale Online".into(),
+        ];
+        let spin_off = normalize("Sword.Art.Online.Alternative.Gun.Gale.Online.S01.1080p.BluRay.Dual-Audio.Opus.2.0.x265-YURASUKA (GGO)");
+        assert!(names_a_sibling(&spin_off, &own, &related));
+        let own_release = normalize("[Erai-raws] Sword Art Online II - 01 ~ 24 [1080p][Multiple Subtitle]");
+        assert!(!names_a_sibling(&own_release, &own, &related));
+    }
+
+    #[test]
+    fn nyaa_queries_exclude_what_names_a_related_entry() {
+        let own: Vec<String> = vec!["Sword Art Online II".into(), "SAO2".into(), "GGO".into()];
+        let related: Vec<String> = vec![
+            "Sword Art Online: Extra Edition".into(),
+            "Sword Art Online: Ordinal Scale".into(),
+            "Sword Art Online".into(),
+            "Sword Art Online Alternative: Gun Gale Online".into(),
+        ];
+        let sib = SiblingTitles { own: &own, related: &related };
+        assert_eq!(sibling_exclusions(&sib), " -ordinal -alternative");
+        assert_eq!(sibling_exclusions(&SiblingTitles { own: &own, related: &[] }), "");
+    }
+
+    #[test]
+    fn a_dash_inside_a_romanized_word_still_matches() {
+        let q = normalize("Tenkousaki no Seiso Karen na Bishoujo ga, Mukashi Danshi to Omotte Issho ni Asonda Osananajimi datta Ken");
+        let alts = vec![q.clone()];
+        let erai = "[Erai-raws] Tenkou-saki no Seiso Karen na Bishoujo ga, Mukashi Danshi to Omotte Issho ni Asonda Osananajimi Datta Ken - 10 [1080p CR WEBRip HEVC AAC][MultiSub][D986D143]";
+        assert!(title_matches_with_alts(&q, erai, &alts));
+        // And the other way round, and never across a word boundary.
+        assert!(title_matches_with_alts(&normalize("Tenkou-saki no Seiso"), "[G] Tenkousaki no Seiso - 01 [1080p]", &[]));
+        assert!(!title_matches_with_alts(&normalize("Monster"), "[G] Monsters - 01 [1080p]", &[]));
+        assert!(!title_matches_with_alts(&normalize("Re Monster"), "[G] Remonsterland - 01 [1080p]", &[]));
     }
 }
