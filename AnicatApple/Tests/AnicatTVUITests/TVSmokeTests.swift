@@ -60,6 +60,125 @@ final class TVSmokeTests: XCTestCase {
         snapshot("player-after-timeout")
     }
 
+    /// Plays one title, leaves the player, opens a second title and plays
+    /// it. The second resolve must get to a picture as well.
+    func testSecondPlayAfterClosingThePlayer() {
+        remote.press(.down)
+        sleep(1)
+        remote.press(.down)
+        sleep(1)
+        remote.press(.select)
+        let play = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Play' OR label BEGINSWITH 'Resume'")).firstMatch
+        XCTAssertTrue(play.waitForExistence(timeout: 20))
+        sleep(2)
+        remote.press(.select)
+        let player = app.descendants(matching: .any)["tv.player"]
+        XCTAssertTrue(player.waitForExistence(timeout: 90), "no player for the first title")
+        sleep(10)
+        snapshot("first-player")
+        // Menu with the chrome down leaves the player; the chrome is down
+        // after ten seconds.
+        remote.press(.menu)
+        sleep(2)
+        snapshot("after-close")
+        XCTAssertFalse(player.exists, "player still up after Menu")
+        // Back out of the detail to the shelf, move to the next poster.
+        remote.press(.menu)
+        sleep(2)
+        remote.press(.right)
+        sleep(1)
+        remote.press(.select)
+        XCTAssertTrue(play.waitForExistence(timeout: 20))
+        sleep(2)
+        snapshot("second-detail")
+        remote.press(.select)
+        for i in 1...6 {
+            sleep(10)
+            snapshot("second-resolving-\(i * 10)s")
+            if player.exists { break }
+        }
+        snapshot("second-final")
+        XCTAssertTrue(player.exists, "no player for the second title")
+    }
+
+    /// Plays a title, leaves the player, and plays the same title again.
+    /// The second play goes through the remembered release and the
+    /// torrent the first one paused.
+    func testReplayAfterClosingThePlayer() {
+        remote.press(.down)
+        sleep(1)
+        remote.press(.down)
+        sleep(1)
+        remote.press(.select)
+        let play = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Play' OR label BEGINSWITH 'Resume'")).firstMatch
+        XCTAssertTrue(play.waitForExistence(timeout: 20))
+        sleep(2)
+        remote.press(.select)
+        let player = app.descendants(matching: .any)["tv.player"]
+        XCTAssertTrue(player.waitForExistence(timeout: 90), "no player for the first play")
+        sleep(10)
+        remote.press(.menu)
+        sleep(3)
+        XCTAssertFalse(player.exists, "player still up after Menu")
+        snapshot("replay-detail")
+        remote.press(.select)
+        for i in 1...6 {
+            sleep(10)
+            snapshot("replay-resolving-\(i * 10)s")
+            if player.exists { break }
+        }
+        snapshot("replay-final")
+        XCTAssertTrue(player.exists, "no player for the replay")
+    }
+
+    /// Plays from Up Next, leaves the player with the detail still on that
+    /// tab's stack, moves to Search and plays a title found there. The
+    /// title may have no release yet; then the failure has to be said,
+    /// not swallowed.
+    func testPlayFromSearchAfterPlayingFromUpNext() {
+        remote.press(.down)
+        sleep(1)
+        remote.press(.down)
+        sleep(1)
+        remote.press(.select)
+        let play = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Play' OR label BEGINSWITH 'Resume'")).firstMatch
+        XCTAssertTrue(play.waitForExistence(timeout: 20))
+        sleep(2)
+        remote.press(.select)
+        let player = app.descendants(matching: .any)["tv.player"]
+        XCTAssertTrue(player.waitForExistence(timeout: 90), "no player for the first play")
+        sleep(10)
+        remote.press(.menu)
+        sleep(3)
+        remote.press(.up)
+        sleep(1)
+        remote.press(.up)
+        sleep(1)
+        remote.press(.right)
+        remote.press(.right)
+        sleep(1)
+        XCTAssertTrue(app.scrollViews["Search results"].waitForExistence(timeout: 5))
+        remote.press(.down)
+        sleep(1)
+        app.typeText("dune")
+        let hit = app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "dune")).firstMatch
+        XCTAssertTrue(hit.waitForExistence(timeout: 20))
+        remote.press(.down)
+        sleep(1)
+        remote.press(.select)
+        XCTAssertTrue(play.waitForExistence(timeout: 20), "second detail did not open")
+        sleep(2)
+        snapshot("popular-detail")
+        remote.press(.select)
+        for i in 1...6 {
+            sleep(10)
+            snapshot("popular-resolving-\(i * 10)s")
+            if player.exists || app.buttons["Dismiss"].exists { break }
+        }
+        snapshot("popular-final")
+        XCTAssertTrue(player.exists || app.buttons["Dismiss"].exists, "neither a player nor a failure for the second title")
+    }
+
     private func snapshot(_ name: String) {
         let shot = XCUIScreen.main.screenshot()
         let attachment = XCTAttachment(screenshot: shot)

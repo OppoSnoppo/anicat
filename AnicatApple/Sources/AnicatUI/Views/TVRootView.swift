@@ -92,8 +92,31 @@ public struct TVRootView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .zIndex(40)
             }
+
+            // What a failed play has to say. The desktop shows this as a
+            // banner and the detail page shows its own fetch failure; a
+            // resolve that found nothing had no voice on the TV at all,
+            // so Play looked dead and a two-minute search ended in the
+            // card silently going away. Not shown over the detail page's
+            // own message for a title that never loaded.
+            if let message = model.errorMessage,
+               model.resolveStartedAt == nil,
+               model.activeStreamURL == nil,
+               !(model.selectedMediaDetails == nil && detailOwner != nil) {
+                VStack {
+                    Spacer()
+                    TVErrorCard(message: message, retry: model.errorRetryAction) {
+                        model.errorMessage = nil
+                        model.errorRetryAction = nil
+                    }
+                    .padding(.bottom, 60)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(40)
+            }
         }
         .animation(.snappy, value: model.resolveStartedAt)
+        .animation(.snappy, value: model.errorMessage != nil)
         .animation(.smooth, value: model.activeStreamURL)
         .background(SumiTheme.background.ignoresSafeArea())
         // A deep link straight to `openDetail` has no tab that claimed it;
@@ -797,6 +820,49 @@ struct TVResolvingCard: View {
         .shadow(color: .black.opacity(0.35), radius: 30, y: 10)
         .focusSection()
         .onAppear { cancelFocused = true }
+    }
+}
+
+/// A failed play, with the retry the model offers when one might help and
+/// a Dismiss the remote can reach. Same slot and shape as the resolving
+/// card it follows.
+struct TVErrorCard: View {
+    let message: String
+    let retry: (() -> Void)?
+    let onDismiss: () -> Void
+
+    @FocusState private var dismissFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 24) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 28))
+                .foregroundStyle(SumiTheme.warning)
+            Text(message)
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(SumiTheme.foreground)
+                .lineLimit(3)
+            Spacer(minLength: 24)
+            if let retry {
+                Button("Retry") {
+                    onDismiss()
+                    retry()
+                }
+            }
+            Button("Dismiss", action: onDismiss)
+                .focused($dismissFocused)
+        }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 24)
+        .frame(maxWidth: 1100)
+        .background(SumiTheme.card, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(SumiTheme.border, lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.35), radius: 30, y: 10)
+        .focusSection()
+        .onAppear { dismissFocused = true }
     }
 }
 #endif
