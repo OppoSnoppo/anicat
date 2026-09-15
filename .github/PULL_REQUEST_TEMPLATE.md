@@ -1,3 +1,5 @@
+<!-- Base branch must be `native-swift`, not `master`. See CONTRIBUTING.md. -->
+
 ## What this changes
 
 <!-- What the change does and why. Link the issue it fixes, e.g. "Fixes #12". -->
@@ -8,6 +10,7 @@
 
 ## Checklist
 
+- [ ] Base branch is `native-swift`
 - [ ] `cargo test --lib` and `cargo clippy --lib --tests -- -D warnings` pass in `core/`
 - [ ] `swift build --product Anicat` and `swift test` pass in `AnicatApple/`
 - [ ] `scripts/build-xcframework.sh` rerun if `core/src/ffi.rs` changed

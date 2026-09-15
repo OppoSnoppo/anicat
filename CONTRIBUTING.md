@@ -44,6 +44,14 @@ Stale bindings link fine and then call the wrong symbols at runtime, so rerun
 
 ## Before opening a pull request
 
+**Open pull requests against `native-swift`, not `master`.** `native-swift` is
+the development branch. `master` only moves when a release ships, and the
+install script is downloaded from it, so anything merged there reaches users
+straight away. GitHub selects `master` by default; change the base branch when
+you open the pull request.
+
+Run the checks CI runs:
+
 Run the checks CI runs:
 
 ```bash
